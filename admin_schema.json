@@ -1,0 +1,16 @@
+{
+  "$schema": "https://elitea.ai/admin-config-schema/v1",
+  "plugin": "auth_core",
+  "properties": {
+    "auth_provider": {
+      "type": "string",
+      "title": "Authentication Provider",
+      "description": "The authentication method used for user login.",
+      "path": "auth_provider",
+      "section": "auth",
+      "default": "form",
+      "enum": ["form", "oidc"],
+      "requires_restart": true
+    }
+  }
+}

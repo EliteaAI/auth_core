@@ -1,0 +1,21 @@
+additional_headers:
+  Server: Centry
+
+# db_url: "sqlite:////path/to/auth_core_db.sqlite"  # DB connection URL
+db_options:  # DB options
+#   pool_pre_ping: true
+   echo: false
+   isolation_level: "AUTOCOMMIT"
+
+# auth_provider: saml  # Main auth provider
+# auth_denied_url: "/"  # URL for application-specific 'access denied' page
+
+# default_login_url: "/"  # URL to redirect on login with no target set
+# default_logout_url: "/"  # URL to redirect on logout with no target set
+
+ALLOW_CORS: $ALLOW_CORS
+
+url_prefix: "/"
+static_url_prefix: "/"
+
+rpc_timeout: 120
