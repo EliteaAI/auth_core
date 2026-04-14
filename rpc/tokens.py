@@ -23,6 +23,7 @@ import datetime
 from typing import Optional
 
 import jwt  # pylint: disable=E0401
+import sqlalchemy as sa
 
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
@@ -116,10 +117,15 @@ class RPC:  # pylint: disable=R0903,E1101
         window_start = now + datetime.timedelta(hours=23)
         window_end = now + datetime.timedelta(hours=24)
         #
-        query = self.db.tbl.token.select().where(
-            self.db.tbl.token.c.expires != None,  # pylint: disable=C0121
-            self.db.tbl.token.c.expires >= window_start,
-            self.db.tbl.token.c.expires <= window_end,
+        tbl = self.db.tbl.token
+        query = sa.select(
+            tbl.c.user_id,
+            tbl.c.uuid,
+            tbl.c.name,
+        ).where(
+            tbl.c.expires != None,  # pylint: disable=C0121
+            tbl.c.expires >= window_start,
+            tbl.c.expires <= window_end,
         )
         with self.db.engine.connect() as connection:
             tokens = connection.execute(query).mappings().all()
