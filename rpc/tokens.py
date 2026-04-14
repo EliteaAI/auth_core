@@ -108,6 +108,25 @@ class RPC:  # pylint: disable=R0903,E1101
             db_tools.sqlalchemy_mapping_to_dict(item) for item in tokens
         ]
 
+    @web.rpc("auth_list_tokens_expiring_soon", "list_tokens_expiring_soon")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def list_tokens_expiring_soon(self):
+        """ Return tokens whose expires is within [now+23h, now+25h] """
+        now = datetime.datetime.utcnow()
+        window_start = now + datetime.timedelta(hours=23)
+        window_end = now + datetime.timedelta(hours=24)
+        #
+        query = self.db.tbl.token.select().where(
+            self.db.tbl.token.c.expires != None,  # pylint: disable=C0121
+            self.db.tbl.token.c.expires >= window_start,
+            self.db.tbl.token.c.expires <= window_end,
+        )
+        with self.db.engine.connect() as connection:
+            tokens = connection.execute(query).mappings().all()
+        return [
+            db_tools.sqlalchemy_mapping_to_dict(item) for item in tokens
+        ]
+
     @web.rpc("auth_encode_token", "encode_token")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def encode_token(self, token_id: Optional[int] = None, uuid: Optional[str] = None):
