@@ -23,6 +23,7 @@ import datetime
 from typing import Optional
 
 import jwt  # pylint: disable=E0401
+import sqlalchemy as sa
 
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
@@ -102,6 +103,30 @@ class RPC:  # pylint: disable=R0903,E1101
         if where:
             query = query.where(*where)
 
+        with self.db.engine.connect() as connection:
+            tokens = connection.execute(query).mappings().all()
+        return [
+            db_tools.sqlalchemy_mapping_to_dict(item) for item in tokens
+        ]
+
+    @web.rpc("auth_list_tokens_expiring_soon", "list_tokens_expiring_soon")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def list_tokens_expiring_soon(self):
+        """ Return tokens whose expires is within [now+23h, now+25h] """
+        now = datetime.datetime.utcnow()
+        window_start = now + datetime.timedelta(hours=23)
+        window_end = now + datetime.timedelta(hours=24)
+        #
+        tbl = self.db.tbl.token
+        query = sa.select(
+            tbl.c.user_id,
+            tbl.c.uuid,
+            tbl.c.name,
+        ).where(
+            tbl.c.expires != None,  # pylint: disable=C0121
+            tbl.c.expires >= window_start,
+            tbl.c.expires <= window_end,
+        )
         with self.db.engine.connect() as connection:
             tokens = connection.execute(query).mappings().all()
         return [
