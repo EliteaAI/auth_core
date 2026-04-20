@@ -113,7 +113,7 @@ class RPC:  # pylint: disable=R0903,E1101
     @rpc_tools.wrap_exceptions(RuntimeError)
     def list_tokens_expiring_soon(self):
         """ Return tokens whose expires is within [now+23h, now+25h] """
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now()
         window_start = now + datetime.timedelta(hours=23)
         window_end = now + datetime.timedelta(hours=24)
         #
