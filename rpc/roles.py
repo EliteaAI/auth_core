@@ -142,6 +142,22 @@ class RPC:  # pylint: disable=R0903,E1101
                 )
             case _:
                 with self.db.engine.connect() as connection:
+                    # Remove existing roles in this mode first (enforce single role)
+                    existing_role_ids = [
+                        row['id'] for row in connection.execute(
+                            self.db.tbl.role.select().where(
+                                self.db.tbl.role.c.mode == mode,
+                            )
+                        ).mappings().all()
+                    ]
+                    if existing_role_ids:
+                        connection.execute(
+                            self.db.tbl.user_role.delete().where(
+                                self.db.tbl.user_role.c.user_id == user_id,
+                                self.db.tbl.user_role.c.role_id.in_(existing_role_ids),
+                            )
+                        )
+                    #
                     role_id = connection.execute(
                         self.db.tbl.role.select().where(
                             self.db.tbl.role.c.name == role_name,
