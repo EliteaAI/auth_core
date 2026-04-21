@@ -220,29 +220,54 @@ class RPC:  # pylint: disable=R0903,E1101
             #
             rows = connection.execute(query).mappings().all()
             #
-            # Batch-check admin status (administration mode)
-            admin_user_ids = set()
+            # Batch-fetch administration roles for users
+            # Role priority: super_admin > admin > editor > viewer
+            user_admin_roles = {}
             user_ids = [row['id'] for row in rows]
             if user_ids:
-                admin_role_q = sqlalchemy.select(
-                    self.db.tbl.role.c.id
+                # Get all administration mode roles
+                admin_roles_q = sqlalchemy.select(
+                    self.db.tbl.role.c.id,
+                    self.db.tbl.role.c.name,
                 ).where(
-                    self.db.tbl.role.c.name == 'admin',
                     self.db.tbl.role.c.mode == 'administration',
                 )
-                admin_role_row = connection.execute(admin_role_q).first()
-                if admin_role_row:
-                    admin_users_q = sqlalchemy.select(
-                        self.db.tbl.user_role.c.user_id
+                admin_roles = {r[0]: r[1] for r in connection.execute(admin_roles_q).all()}
+                #
+                if admin_roles:
+                    # Get user-role assignments for these users
+                    user_roles_q = sqlalchemy.select(
+                        self.db.tbl.user_role.c.user_id,
+                        self.db.tbl.user_role.c.role_id,
                     ).where(
-                        self.db.tbl.user_role.c.role_id == admin_role_row[0],
+                        self.db.tbl.user_role.c.role_id.in_(admin_roles.keys()),
                         self.db.tbl.user_role.c.user_id.in_(user_ids),
                     )
-                    admin_user_ids = {r[0] for r in connection.execute(admin_users_q).all()}
+                    #
+                    # Role priority order (highest first)
+                    role_priority = ['super_admin', 'admin', 'editor', 'viewer']
+                    #
+                    for user_id, role_id in connection.execute(user_roles_q).all():
+                        role_name = admin_roles.get(role_id)
+                        if role_name:
+                            # Keep the highest priority role
+                            current_role = user_admin_roles.get(user_id)
+                            if current_role is None:
+                                user_admin_roles[user_id] = role_name
+                            else:
+                                # Compare priorities
+                                current_priority = role_priority.index(current_role) if current_role in role_priority else 999
+                                new_priority = role_priority.index(role_name) if role_name in role_priority else 999
+                                if new_priority < current_priority:
+                                    user_admin_roles[user_id] = role_name
         #
         return {
             "rows": [
-                {**db_tools.sqlalchemy_mapping_to_dict(item), "is_admin": item['id'] in admin_user_ids}
+                {
+                    **db_tools.sqlalchemy_mapping_to_dict(item),
+                    "is_admin": item['id'] in user_admin_roles,  # Backward compatibility
+                    "admin_role": user_admin_roles.get(item['id']),  # New field: role name or None
+                }
                 for item in rows
             ],
             "total": total,
