@@ -333,14 +333,17 @@ class RPC:  # pylint: disable=R0903,E1101
         if mode in ['default', 'prompt_lib']:
             if project_id:
                 try:
-                    return self.context.rpc_manager.timeout(
-                        rpc_timeout
-                    ).admin_get_permissions_in_project(
+                    # Resolve project permissions locally. This used to RPC out to
+                    # pylon_main.admin_get_permissions_in_project, which only calls
+                    # straight back to auth's own get_project_user_permissions — a
+                    # re-entrant cross-pod round-trip that deadlocks the RPC worker
+                    # pool under concurrency. Call the local method directly instead.
+                    return self.get_project_user_permissions(
                         project_id=project_id,
-                        user_id=user_id
+                        user_id=user_id,
                     )
                 except:  # pylint: disable=W0702
-                    log.exception("Main pylon RPC call error")
+                    log.exception("Failed to resolve project user permissions")
                     return set()
             else:
                 return set()
