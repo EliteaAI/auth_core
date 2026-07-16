@@ -34,7 +34,11 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_add_user", "add_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def add_user(self, email: str, name: Optional[str] = '', id_: Optional[int] = None):
+    def add_user(self, email: Optional[str] = None, name: Optional[str] = '', id_: Optional[int] = None, upn: Optional[str] = None):
+        if not email and upn:
+            email = upn
+        if not email:
+            raise ValueError("Either email or upn must be provided")
         values = {
             "email": email,
         }
