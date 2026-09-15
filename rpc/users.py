@@ -18,6 +18,7 @@
 
 """ RPC """
 
+import uuid as uuid_
 import datetime
 from typing import Optional
 
@@ -28,6 +29,7 @@ from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
 from ..tools import rpc_tools
 from ..db import db_tools
+from .tokens import SYSTEM_TOKEN_NAME
 
 
 class RPC:  # pylint: disable=R0903,E1101
@@ -35,6 +37,7 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_add_user", "add_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def add_user(self, email: str, name: Optional[str] = '', id_: Optional[int] = None):
+        """ Create a user together with its system token, atomically """
         values = {
             "email": email,
         }
@@ -43,10 +46,31 @@ class RPC:  # pylint: disable=R0903,E1101
         if id_:
             values["id"] = id_
 
-        with self.db.engine.connect() as connection:
-            return connection.execute(
-                self.db.tbl.user.insert().values(**values)
-            ).inserted_primary_key[0]
+        # The engine is configured with isolation_level=AUTOCOMMIT, so the two
+        # inserts below would commit independently and a crash in between would
+        # leave a user with no system token. Request a real transaction for this
+        # connection only.
+        isolation_level = "SERIALIZABLE" \
+            if self.db.url.startswith("sqlite:") else "READ COMMITTED"
+
+        with self.db.engine.connect().execution_options(
+                isolation_level=isolation_level,
+        ) as connection:
+            with connection.begin():
+                user_id = connection.execute(
+                    self.db.tbl.user.insert().values(**values)
+                ).inserted_primary_key[0]
+                #
+                connection.execute(
+                    self.db.tbl.token.insert().values(
+                        uuid=str(uuid_.uuid4()),
+                        user_id=user_id,
+                        expires=None,
+                        name=SYSTEM_TOKEN_NAME,
+                    )
+                )
+        #
+        return user_id
 
     @web.rpc("auth_update_user", "update_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
