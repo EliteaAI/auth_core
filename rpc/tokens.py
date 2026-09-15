@@ -31,6 +31,13 @@ from ..tools import rpc_tools
 from ..db import db_tools
 
 
+# Reserved name of the platform-owned, non-expiring token that every user has.
+# The name is the only marker: there is no dedicated column, so a token is a
+# system token iff name == SYSTEM_TOKEN_NAME. The public POST /token endpoint
+# rejects this name, which is what keeps the marker unforgeable.
+SYSTEM_TOKEN_NAME = "elitea-system"
+
+
 class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_add_token", "add_token")
@@ -59,13 +66,24 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_delete_token", "delete_token")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def delete_token(self, token_id: int):
+    def delete_token(self, token_id: int, allow_system: bool = False):
+        """ Delete a token. System tokens are skipped unless allow_system is set.
+
+        The guard is part of the WHERE clause rather than a pre-check, so it
+        cannot be raced. Returns the number of deleted rows: 0 means the token
+        did not exist or was a system token.
+        """
+        query = self.db.tbl.token.delete().where(
+            self.db.tbl.token.c.id == token_id
+        )
+        #
+        if not allow_system:
+            query = query.where(
+                self.db.tbl.token.c.name != SYSTEM_TOKEN_NAME
+            )
+        #
         with self.db.engine.connect() as connection:
-            return connection.execute(
-                self.db.tbl.token.delete().where(
-                    self.db.tbl.token.c.id == token_id
-                )
-            ).rowcount
+            return connection.execute(query).rowcount
 
     @web.rpc("auth_get_token", "get_token")
     @rpc_tools.wrap_exceptions(RuntimeError)
@@ -92,13 +110,26 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_list_tokens", "list_tokens")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def list_tokens(self, user_id: Optional[int] = None, name: Optional[str] = None):
+    def list_tokens(
+            self,
+            user_id: Optional[int] = None,
+            name: Optional[str] = None,
+            include_system: bool = False,
+    ):
+        """ List tokens. System tokens are excluded unless include_system is set.
+
+        The default excludes them so that existing callers - the user-facing
+        token list above all - keep their current semantics untouched. Asking
+        for name=SYSTEM_TOKEN_NAME still requires include_system=True.
+        """
         where = []
         query = self.db.tbl.token.select()
         if name is not None:
             where.append(self.db.tbl.token.c.name == name)
         if user_id is not None:
             where.append(self.db.tbl.token.c.user_id == user_id)
+        if not include_system:
+            where.append(self.db.tbl.token.c.name != SYSTEM_TOKEN_NAME)
 
         if where:
             query = query.where(*where)
@@ -108,6 +139,99 @@ class RPC:  # pylint: disable=R0903,E1101
         return [
             db_tools.sqlalchemy_mapping_to_dict(item) for item in tokens
         ]
+
+    @web.rpc("auth_ensure_system_token", "ensure_system_token")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def ensure_system_token(self, user_id: int) -> str:
+        """ Get-or-create this user's system token, returning it encoded """
+        tbl = self.db.tbl.token
+        #
+        with self.db.engine.connect() as connection:
+            row = connection.execute(
+                sa.select(tbl.c.uuid).where(
+                    tbl.c.user_id == user_id,
+                    tbl.c.name == SYSTEM_TOKEN_NAME,
+                ).limit(1)
+            ).first()
+            #
+            if row is not None:
+                token_uuid = row[0]
+            else:
+                token_uuid = str(uuid_.uuid4())
+                connection.execute(
+                    tbl.insert().values(
+                        uuid=token_uuid,
+                        user_id=user_id,
+                        expires=None,
+                        name=SYSTEM_TOKEN_NAME,
+                    )
+                )
+        #
+        return self.encode_token(uuid=token_uuid)
+
+    @web.rpc("auth_backfill_system_tokens", "backfill_system_tokens")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def backfill_system_tokens(self, dry_run: bool = False) -> dict:
+        """ Give every existing user a system token. Safe to re-run """
+        user_tbl = self.db.tbl.user
+        token_tbl = self.db.tbl.token
+        #
+        has_system_token = sa.exists().where(
+            token_tbl.c.user_id == user_tbl.c.id,
+            token_tbl.c.name == SYSTEM_TOKEN_NAME,
+        )
+        #
+        with self.db.engine.connect() as connection:
+            users_total = connection.execute(
+                sa.select(sa.func.count()).select_from(user_tbl)
+            ).scalar()
+            #
+            missing_user_ids = connection.execute(
+                sa.select(user_tbl.c.id).where(~has_system_token)
+            ).scalars().all()
+            #
+            # A row already named SYSTEM_TOKEN_NAME but carrying an expiry
+            # satisfies "one per user" yet breaks the "never expires" half of
+            # the invariant, so resolution would hand out an expired token.
+            # Adopt it instead of adding a second row.
+            is_expiring_squatter = (
+                token_tbl.c.name == SYSTEM_TOKEN_NAME,
+                token_tbl.c.expires.is_not(None),
+            )
+            squatters_adopted = connection.execute(
+                sa.select(sa.func.count()).select_from(token_tbl).where(
+                    *is_expiring_squatter
+                )
+            ).scalar()
+            #
+            if not dry_run:
+                if missing_user_ids:
+                    connection.execute(
+                        token_tbl.insert(),
+                        [
+                            {
+                                "uuid": str(uuid_.uuid4()),
+                                "expires": None,
+                                "user_id": user_id,
+                                "name": SYSTEM_TOKEN_NAME,
+                            }
+                            for user_id in missing_user_ids
+                        ],
+                    )
+                if squatters_adopted:
+                    connection.execute(
+                        token_tbl.update().where(
+                            *is_expiring_squatter
+                        ).values(expires=None)
+                    )
+        #
+        return {
+            "dry_run": dry_run,
+            "users_total": users_total,
+            "already_present": users_total - len(missing_user_ids),
+            "created": len(missing_user_ids),
+            "squatters_adopted": squatters_adopted,
+        }
 
     @web.rpc("auth_list_tokens_expiring_soon", "list_tokens_expiring_soon")
     @rpc_tools.wrap_exceptions(RuntimeError)
