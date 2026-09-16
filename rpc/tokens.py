@@ -33,9 +33,14 @@ from ..db import db_tools
 
 # Reserved name of the platform-owned, non-expiring token that every user has.
 # The name is the only marker: there is no dedicated column, so a token is a
-# system token iff name == SYSTEM_TOKEN_NAME. The public POST /token endpoint
-# rejects this name, which is what keeps the marker unforgeable.
+# system token iff name == SYSTEM_TOKEN_NAME and it never expires. add_token()
+# below rejects the name, which is what keeps the marker unforgeable.
 SYSTEM_TOKEN_NAME = "elitea-system"
+
+# A row that carries the reserved name but breaks the rest of the invariant is
+# renamed to this prefix plus its own id, which takes it out of the reserved
+# namespace while leaving it a listable, deletable token of its owner.
+EVICTED_NAME_PREFIX = f"{SYSTEM_TOKEN_NAME}-conflict-"
 
 
 class RPC:  # pylint: disable=R0903,E1101
@@ -47,6 +52,13 @@ class RPC:  # pylint: disable=R0903,E1101
                    name: str = "",
                    expires: Optional[datetime.datetime] = None,
                    token_id: Optional[int] = None):
+        if name == SYSTEM_TOKEN_NAME:
+            # System tokens are inserted by ensure_system_token() and add_user()
+            # directly. Refusing the name here means no other caller - including
+            # one that bypasses the HTTP layer - can mint a row that resolution
+            # would later mistake for the platform's own token.
+            raise ValueError(f"Token name is reserved: {name}")
+        #
         token_uuid = str(uuid_.uuid4())
         #
         values = {
@@ -143,21 +155,53 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_ensure_system_token", "ensure_system_token")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def ensure_system_token(self, user_id: int) -> str:
-        """ Get-or-create this user's system token, returning it encoded """
+        """ Get-or-create this user's system token, returning it encoded
+
+        Only a row that satisfies the whole invariant - reserved name *and* no
+        expiry - counts. A row that carries the name with an expiry is not
+        repaired in place: clearing its expiry would silently promote a token
+        its owner created, and may have exposed, into a permanent credential the
+        API then refuses to list or delete. It is evicted from the reserved
+        namespace instead and a fresh system token is minted.
+        """
         tbl = self.db.tbl.token
+        #
+        is_system_token = (
+            tbl.c.user_id == user_id,
+            tbl.c.name == SYSTEM_TOKEN_NAME,
+            tbl.c.expires.is_(None),
+        )
         #
         with self.db.engine.connect() as connection:
             row = connection.execute(
-                sa.select(tbl.c.uuid).where(
-                    tbl.c.user_id == user_id,
-                    tbl.c.name == SYSTEM_TOKEN_NAME,
-                ).limit(1)
+                sa.select(tbl.c.uuid).where(*is_system_token).limit(1)
             ).first()
             #
             if row is not None:
-                token_uuid = row[0]
-            else:
-                token_uuid = str(uuid_.uuid4())
+                return self.encode_token(uuid=row[0])
+            #
+            # Nothing valid exists, so any row left under the reserved name for
+            # this user necessarily carries an expiry.
+            evicted = connection.execute(
+                tbl.update().where(
+                    tbl.c.user_id == user_id,
+                    tbl.c.name == SYSTEM_TOKEN_NAME,
+                ).values(
+                    name=sa.literal(EVICTED_NAME_PREFIX, sa.Text).concat(
+                        sa.cast(tbl.c.id, sa.Text)
+                    ),
+                )
+            ).rowcount
+            #
+            if evicted:
+                log.warning(
+                    "Evicted %s expiring token(s) from the reserved name "
+                    "for user %s", evicted, user_id,
+                )
+            #
+            token_uuid = str(uuid_.uuid4())
+            #
+            try:
                 connection.execute(
                     tbl.insert().values(
                         uuid=token_uuid,
@@ -166,6 +210,19 @@ class RPC:  # pylint: disable=R0903,E1101
                         name=SYSTEM_TOKEN_NAME,
                     )
                 )
+            except sa.exc.IntegrityError:
+                # The one-per-user index rejected the insert, so a concurrent
+                # caller got there first. Its row is the system token now.
+                connection.rollback()
+                #
+                row = connection.execute(
+                    sa.select(tbl.c.uuid).where(*is_system_token).limit(1)
+                ).first()
+                #
+                if row is None:
+                    raise
+                #
+                token_uuid = row[0]
         #
         return self.encode_token(uuid=token_uuid)
 
@@ -190,47 +247,44 @@ class RPC:  # pylint: disable=R0903,E1101
                 sa.select(user_tbl.c.id).where(~has_system_token)
             ).scalars().all()
             #
-            # A row already named SYSTEM_TOKEN_NAME but carrying an expiry
-            # satisfies "one per user" yet breaks the "never expires" half of
-            # the invariant, so resolution would hand out an expired token.
-            # Adopt it instead of adding a second row.
-            is_expiring_squatter = (
-                token_tbl.c.name == SYSTEM_TOKEN_NAME,
-                token_tbl.c.expires.is_not(None),
-            )
-            squatters_adopted = connection.execute(
+            # The 202609161200 migration cleared the reserved namespace, and
+            # add_token() refuses the name, so this should be 0. It is reported
+            # rather than fixed: such a user counts as "already present" here
+            # and is left to ensure_system_token(), which evicts the row at the
+            # point of use instead of mutating credentials from a bulk job.
+            reserved_name_conflicts = connection.execute(
                 sa.select(sa.func.count()).select_from(token_tbl).where(
-                    *is_expiring_squatter
+                    token_tbl.c.name == SYSTEM_TOKEN_NAME,
+                    token_tbl.c.expires.is_not(None),
                 )
             ).scalar()
             #
-            if not dry_run:
-                if missing_user_ids:
-                    connection.execute(
-                        token_tbl.insert(),
-                        [
-                            {
-                                "uuid": str(uuid_.uuid4()),
-                                "expires": None,
-                                "user_id": user_id,
-                                "name": SYSTEM_TOKEN_NAME,
-                            }
-                            for user_id in missing_user_ids
-                        ],
-                    )
-                if squatters_adopted:
-                    connection.execute(
-                        token_tbl.update().where(
-                            *is_expiring_squatter
-                        ).values(expires=None)
-                    )
+            if reserved_name_conflicts:
+                log.warning(
+                    "%s token(s) hold the reserved name with an expiry",
+                    reserved_name_conflicts,
+                )
+            #
+            if not dry_run and missing_user_ids:
+                connection.execute(
+                    token_tbl.insert(),
+                    [
+                        {
+                            "uuid": str(uuid_.uuid4()),
+                            "expires": None,
+                            "user_id": user_id,
+                            "name": SYSTEM_TOKEN_NAME,
+                        }
+                        for user_id in missing_user_ids
+                    ],
+                )
         #
         return {
             "dry_run": dry_run,
             "users_total": users_total,
             "already_present": users_total - len(missing_user_ids),
             "created": len(missing_user_ids),
-            "squatters_adopted": squatters_adopted,
+            "reserved_name_conflicts": reserved_name_conflicts,
         }
 
     @web.rpc("auth_list_tokens_expiring_soon", "list_tokens_expiring_soon")
