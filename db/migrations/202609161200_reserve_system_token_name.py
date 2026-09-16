@@ -50,6 +50,8 @@ branch_labels = None
 from alembic import op  # pylint: disable=E0401,C0413
 import sqlalchemy as sa  # pylint: disable=E0401,C0413
 
+from pylon.core.tools import log  # pylint: disable=E0401,C0413
+
 
 # Kept in sync with rpc/tokens.py by hand: a migration has to stay readable at
 # the revision it was written, so it does not import runtime constants.
@@ -65,15 +67,31 @@ def upgrade(module, payload):
     _ = payload
     table = f"{module.descriptor.name}__token"
 
-    op.execute(
+    evicted = op.get_bind().execute(
         sa.text(
             f"""
             UPDATE {table}
             SET name = :prefix || CAST(id AS TEXT)
             WHERE name = :reserved
+            RETURNING id, user_id
             """
         ).bindparams(prefix=EVICTED_NAME_PREFIX, reserved=SYSTEM_TOKEN_NAME)
-    )
+    ).fetchall()
+
+    # The runbook's pre-flight query finds these rows by their new name, which
+    # stops identifying them as soon as their owners add or remove tokens of
+    # their own. This is the only durable record of whose token the release
+    # renamed, and a rollback cannot reconstruct it.
+    if evicted:
+        log.warning(
+            "Renamed %s token(s) out of the reserved name %r; report to owners",
+            len(evicted), SYSTEM_TOKEN_NAME,
+        )
+    for token_id, user_id in evicted:
+        log.warning(
+            "Renamed token %s of user %s to %s%s",
+            token_id, user_id, EVICTED_NAME_PREFIX, token_id,
+        )
 
     where = sa.text(f"name = '{SYSTEM_TOKEN_NAME}'")
     op.create_index(

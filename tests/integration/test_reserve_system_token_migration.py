@@ -33,6 +33,30 @@ def revision(plugin_root: pathlib.Path):
     return helpers.load_module_from_path(path, "revision_202609161200")
 
 
+class RecordingLog:
+    """Captures the eviction record the way an operator would read it."""
+
+    def __init__(self):
+        self.warnings = []
+
+    def warning(self, message, *args):
+        self.warnings.append(message % args if args else message)
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
+
+    @property
+    def text(self):
+        return "\n".join(self.warnings)
+
+
+@pytest.fixture
+def pylon_log(revision, monkeypatch):
+    recorder = RecordingLog()
+    monkeypatch.setattr(revision, "log", recorder)
+    return recorder
+
+
 @pytest.fixture
 def module():
     """What the revision reads: module.descriptor.name is the table prefix."""
@@ -124,6 +148,30 @@ def test_upgrade_leaves_other_tokens_alone(revision, engine, module, token_tbl):
     run(revision, engine, module)
 
     assert fetch(engine, token_tbl, ordinary)["name"] == f"{SYSTEM_TOKEN_NAME}-2"
+
+
+# --- the eviction has to be findable afterwards ----------------------------
+
+
+def test_each_evicted_row_is_logged(revision, engine, module, token_tbl, pylon_log):
+    """A rollback cannot restore the old name, so who was renamed has to be recorded."""
+    first = insert(engine, token_tbl, 7, SYSTEM_TOKEN_NAME, "first")
+    second = insert(engine, token_tbl, 9, SYSTEM_TOKEN_NAME, "second")
+
+    run(revision, engine, module)
+
+    assert f"Renamed token {first} of user 7" in pylon_log.text
+    assert f"Renamed token {second} of user 9" in pylon_log.text
+    assert "Renamed 2 token(s) out of the reserved name" in pylon_log.text
+
+
+def test_a_clean_table_logs_nothing(revision, engine, module, token_tbl, pylon_log):
+    """The expected case must not leave a line that reads like a finding."""
+    insert(engine, token_tbl, 1, "mine", "mine-uuid")
+
+    run(revision, engine, module)
+
+    assert pylon_log.warnings == []
 
 
 def test_upgrade_creates_the_index(revision, engine, module, token_tbl):
