@@ -165,6 +165,7 @@ class RPC:  # pylint: disable=R0903,E1101
         namespace instead and a fresh system token is minted.
         """
         tbl = self.db.tbl.token
+        user_tbl = self.db.tbl.user
         #
         is_system_token = (
             tbl.c.user_id == user_id,
@@ -173,6 +174,17 @@ class RPC:  # pylint: disable=R0903,E1101
         )
         #
         with self.db.engine.connect() as connection:
+            # A suspended user gets neither a new system token nor the one they
+            # already have. handle_bearer_token() refuses it anyway; refusing to
+            # hand it out means a suspended account cannot be left holding a
+            # freshly minted permanent credential either.
+            if connection.execute(
+                sa.select(user_tbl.c.suspended).where(
+                    user_tbl.c.id == user_id,
+                )
+            ).scalar():
+                raise ValueError(f"User is suspended: {user_id}")
+            #
             row = connection.execute(
                 sa.select(tbl.c.uuid).where(*is_system_token).limit(1)
             ).first()
@@ -229,7 +241,18 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_backfill_system_tokens", "backfill_system_tokens")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def backfill_system_tokens(self, dry_run: bool = False) -> dict:
-        """ Give every existing user a system token. Safe to re-run """
+        """ Give every existing user a system token. Safe to re-run
+
+        Concurrency-safe against itself and against ensure_system_token(): the
+        scan only decides who to try, and each insert is its own statement whose
+        loss to the one-per-user index is counted, not raised. So "created" is
+        the number of rows this run actually wrote, and a second backfill running
+        alongside the first reports 0 rather than double-counting.
+
+        Suspended users are skipped. handle_bearer_token() and
+        ensure_system_token() both refuse them, so minting the row here would
+        only stockpile permanent credentials for accounts that must not use one.
+        """
         user_tbl = self.db.tbl.user
         token_tbl = self.db.tbl.token
         #
@@ -244,8 +267,18 @@ class RPC:  # pylint: disable=R0903,E1101
             ).scalar()
             #
             missing_user_ids = connection.execute(
-                sa.select(user_tbl.c.id).where(~has_system_token)
+                sa.select(user_tbl.c.id).where(
+                    ~has_system_token,
+                    sa.not_(user_tbl.c.suspended),
+                )
             ).scalars().all()
+            #
+            skipped_suspended = connection.execute(
+                sa.select(sa.func.count()).select_from(user_tbl).where(
+                    ~has_system_token,
+                    user_tbl.c.suspended,
+                )
+            ).scalar()
             #
             # The 202609161200 migration cleared the reserved namespace, and
             # add_token() refuses the name, so this should be 0. It is reported
@@ -265,25 +298,42 @@ class RPC:  # pylint: disable=R0903,E1101
                     reserved_name_conflicts,
                 )
             #
-            if not dry_run and missing_user_ids:
-                connection.execute(
-                    token_tbl.insert(),
-                    [
-                        {
-                            "uuid": str(uuid_.uuid4()),
-                            "expires": None,
-                            "user_id": user_id,
-                            "name": SYSTEM_TOKEN_NAME,
-                        }
-                        for user_id in missing_user_ids
-                    ],
+            created = 0
+            lost_races = 0
+            #
+            if not dry_run:
+                for user_id in missing_user_ids:
+                    try:
+                        connection.execute(
+                            token_tbl.insert().values(
+                                uuid=str(uuid_.uuid4()),
+                                expires=None,
+                                user_id=user_id,
+                                name=SYSTEM_TOKEN_NAME,
+                            )
+                        )
+                        created += 1
+                    except sa.exc.IntegrityError:
+                        # Someone provisioned this user between the scan and now
+                        # - a login calling ensure_system_token(), or a second
+                        # backfill. Their row is the system token; ours was never
+                        # needed.
+                        connection.rollback()
+                        lost_races += 1
+            #
+            if lost_races:
+                log.info(
+                    "%s user(s) were provisioned concurrently during the "
+                    "backfill", lost_races,
                 )
         #
         return {
             "dry_run": dry_run,
             "users_total": users_total,
-            "already_present": users_total - len(missing_user_ids),
-            "created": len(missing_user_ids),
+            "already_present": users_total - len(missing_user_ids) - skipped_suspended,
+            "missing": len(missing_user_ids),
+            "created": created,
+            "skipped_suspended": skipped_suspended,
             "reserved_name_conflicts": reserved_name_conflicts,
         }
 

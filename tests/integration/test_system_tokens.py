@@ -264,7 +264,8 @@ def test_backfill_dry_run_writes_nothing(rpc):
     result = rpc.backfill_system_tokens(dry_run=True)
 
     assert result["dry_run"] is True
-    assert result["created"] == 2
+    assert result["missing"] == 2
+    assert result["created"] == 0, "a dry run creates nothing, so it reports none"
     assert rows(rpc) == []
 
 
@@ -283,6 +284,63 @@ def test_backfill_reports_conflicts_without_touching_them(rpc):
     untouched = rows(rpc, id=token_id)[0]
     assert untouched["name"] == SYSTEM_TOKEN_NAME
     assert untouched["expires"] == FUTURE
+
+
+def test_backfill_survives_a_login_provisioning_mid_run(rpc, tokens, monkeypatch):
+    """The window between the backfill's scan and its insert is real.
+
+    ensure_system_token() can land in it - any login does - and the unique index
+    then rejects the backfill's row. That must be a counted loss, not a failed
+    migration task.
+    """
+    add_user(rpc, 1)
+
+    real_uuid4 = tokens.uuid_.uuid4
+
+    def uuid4_that_loses_the_race():
+        monkeypatch.setattr(tokens.uuid_, "uuid4", real_uuid4)
+        rpc.ensure_system_token(user_id=1)
+        return real_uuid4()
+
+    monkeypatch.setattr(tokens.uuid_, "uuid4", uuid4_that_loses_the_race)
+
+    result = rpc.backfill_system_tokens()
+
+    assert result["created"] == 0, "the row was not written by this run"
+    assert len(rows(rpc, name=SYSTEM_TOKEN_NAME)) == 1
+
+
+def test_two_backfills_do_not_double_provision(rpc, tokens, monkeypatch):
+    """Both scans see the same missing users; only one set of rows may exist."""
+    add_user(rpc, 1)
+    add_user(rpc, 2)
+
+    real_uuid4 = tokens.uuid_.uuid4
+
+    def uuid4_that_runs_a_second_backfill():
+        monkeypatch.setattr(tokens.uuid_, "uuid4", real_uuid4)
+        rpc.backfill_system_tokens()
+        return real_uuid4()
+
+    monkeypatch.setattr(tokens.uuid_, "uuid4", uuid4_that_runs_a_second_backfill)
+
+    result = rpc.backfill_system_tokens()
+
+    assert result["created"] == 0, "the other run wrote both rows"
+    assert len(rows(rpc, name=SYSTEM_TOKEN_NAME)) == 2
+    assert {row["user_id"] for row in rows(rpc, name=SYSTEM_TOKEN_NAME)} == {1, 2}
+
+
+def test_backfill_reports_only_the_rows_it_wrote(rpc):
+    add_user(rpc, 1)
+    add_user(rpc, 2)
+    add_raw_token(rpc, 1, SYSTEM_TOKEN_NAME, "existing")
+
+    result = rpc.backfill_system_tokens()
+
+    assert result["missing"] == 1
+    assert result["created"] == 1
+    assert result["already_present"] == 1
 
 
 def test_backfill_never_violates_the_unique_index(rpc):

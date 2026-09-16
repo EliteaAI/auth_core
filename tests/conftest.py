@@ -31,6 +31,18 @@ def tokens(plugin_root: pathlib.Path):
     return helpers.import_plugin_module(plugin_root, "rpc.tokens")
 
 
+@pytest.fixture(scope="session")
+def credential_handlers(plugin_root: pathlib.Path):
+    """The rpc/credential_handlers.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.credential_handlers")
+
+
+@pytest.fixture(scope="session")
+def users(plugin_root: pathlib.Path):
+    """The rpc/users.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.users")
+
+
 def define_tables(metadata: sa.MetaData) -> tuple:
     """Mirror the token and user DDL from migration 202202021633_core.
 
@@ -53,6 +65,12 @@ def define_tables(metadata: sa.MetaData) -> tuple:
         f"{TABLE_PREFIX}__user", metadata,
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("email", sa.String(255), nullable=True),
+        sa.Column("name", sa.Text, nullable=True),
+        # From migration 202602241500. Auth reads it, so it is not optional here.
+        sa.Column(
+            "suspended", sa.Boolean, nullable=False,
+            server_default=sa.text("false"),
+        ),
     )
     return token, user
 
@@ -85,16 +103,26 @@ def engine(tmp_path) -> sa.Engine:
 
 
 @pytest.fixture
-def rpc(tokens, engine):
-    """A token RPC bound to a real engine, shaped like the live module."""
+def rpc(tokens, credential_handlers, users, engine):
+    """A token RPC bound to a real engine, shaped like the live module.
+
+    Pylon merges every rpc/*.py RPC class into one module instance, so the
+    credential handlers and the user RPC are mixed in here too:
+    handle_bearer_token calls decode_token, add_user writes to the token table,
+    and all three read the same self.db.
+    """
     metadata = sa.MetaData()
     token_tbl, user_tbl = define_tables(metadata)
     metadata.create_all(engine)
     create_system_token_index(engine)
 
-    subject = tokens.RPC()
+    class Subject(tokens.RPC, credential_handlers.RPC, users.RPC):
+        pass
+
+    subject = Subject()
     subject.db = types.SimpleNamespace(
         engine=engine,
+        url=str(engine.url),
         tbl=types.SimpleNamespace(token=token_tbl, user=user_tbl),
     )
     subject.context = types.SimpleNamespace(

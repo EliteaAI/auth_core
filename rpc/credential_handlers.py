@@ -21,6 +21,8 @@
 import base64
 import datetime
 
+import sqlalchemy as sa
+
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
 from ..tools import rpc_tools
@@ -59,6 +61,23 @@ class RPC:  # pylint: disable=R0903,E1101
         if token["expires"] is not None and \
                 datetime.datetime.now() >= token["expires"]:
             raise ValueError("Token expired")
+        #
+        # Suspension is checked here rather than per token, because this is the
+        # one place every token-based request passes through: basic auth below
+        # delegates to it, and a suspended user must not be able to keep working
+        # on a credential they still hold - least of all the non-expiring system
+        # token, which they cannot list or delete.
+        user_tbl = self.db.tbl.user
+        #
+        with self.db.engine.connect() as connection:
+            suspended = connection.execute(
+                sa.select(user_tbl.c.suspended).where(
+                    user_tbl.c.id == token["user_id"],
+                )
+            ).scalar()
+        #
+        if suspended:
+            raise ValueError("User is suspended")
         #
         return "token", token["id"], "-"
 
