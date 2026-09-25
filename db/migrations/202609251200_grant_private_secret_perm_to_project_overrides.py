@@ -23,6 +23,10 @@ onto its own permission so viewers can read their *own* opted-in secret without 
 gaining unsecret on every shared-project secret. Projects whose roles hold an override
 snapshot never fall back to the central template, so without this their admins and
 editors would lose access they had, and viewers would never gain it.
+
+The ids of the rows inserted here are kept in a ledger table so downgrade removes
+exactly those rows. A blanket delete by permission name would also erase grants a
+project admin made on their own (e.g. to a custom role) after this ran.
 """
 
 revision = "202609251200"
@@ -31,6 +35,8 @@ branch_labels = None
 
 from alembic import op  # pylint: disable=E0401,C0413
 import sqlalchemy as sa  # pylint: disable=E0401,C0413
+
+from pylon.core.tools import log  # pylint: disable=E0401,C0413
 
 
 NEW_PERMISSIONS = [
@@ -41,6 +47,8 @@ NEW_PERMISSIONS = [
 _ROLES = ("admin", "editor", "viewer", "super_admin", "system")
 
 ROLE_PERMISSION_PAIRS = [(role, perm) for role in _ROLES for perm in NEW_PERMISSIONS]
+
+LEDGER_SUFFIX = "__mig_202609251200_granted"
 
 
 def _mapping_subquery(db_dialect):
@@ -69,10 +77,15 @@ def upgrade(module, payload):
     _ = payload
 
     module_name = module.descriptor.name
-    db_dialect = op.get_bind().dialect.name
-    mapping = _mapping_subquery(db_dialect)
+    bind = op.get_bind()
+    mapping = _mapping_subquery(bind.dialect.name)
 
-    op.execute(
+    op.create_table(
+        f"{module_name}{LEDGER_SUFFIX}",
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+
+    inserted_ids = bind.execute(
         sa.text(
             f"""
             INSERT INTO {module_name}__project_role_permission (project_id, role_id, permission)
@@ -92,21 +105,35 @@ def upgrade(module, payload):
                   AND ex.role_id = s.role_id
                   AND ex.permission = v.permission
             )
+            RETURNING id
             """
         )
-    )
+    ).scalars().all()
+
+    if inserted_ids:
+        bind.execute(
+            sa.text(f"INSERT INTO {module_name}{LEDGER_SUFFIX} (id) VALUES (:id)"),
+            [{"id": row_id} for row_id in inserted_ids],
+        )
 
 
 def downgrade(module, payload):
     _ = payload
     module_name = module.descriptor.name
+    ledger = f"{module_name}{LEDGER_SUFFIX}"
 
-    # Exact inverse of the permission list added above.
+    if not sa.inspect(op.get_bind()).has_table(ledger):
+        log.warning("%s missing; leaving project role permissions untouched", ledger)
+        return
+
+    # Only rows this revision inserted; independent grants of the same permission stay.
     op.execute(
         sa.text(
             f"""
             DELETE FROM {module_name}__project_role_permission
             WHERE permission IN :perms
+              AND id IN (SELECT id FROM {ledger})
             """
         ).bindparams(sa.bindparam("perms", value=NEW_PERMISSIONS, expanding=True))
     )
+    op.drop_table(ledger)
