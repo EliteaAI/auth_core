@@ -23,7 +23,7 @@ from typing import Optional
 
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
-from sqlalchemy import select, bindparam, and_  # pylint: disable=E0401
+from sqlalchemy import select, bindparam, and_, func  # pylint: disable=E0401
 
 from ..tools import rpc_tools
 from ..db import db_tools
@@ -274,6 +274,29 @@ class RPC:  # pylint: disable=R0903,E1101
                 )
             ).rowcount
         return data
+
+    @web.rpc("auth_delete_permissions_everywhere", "delete_permissions_everywhere")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def delete_permissions_everywhere(self, permissions: list, dry_run: bool = True) -> dict:
+        permissions = [p for p in (permissions or []) if isinstance(p, str) and p]
+        tables = ("role_permission", "project_role_permission", "group_permission", "user_permission")
+        result = {}
+        # Engine runs AUTOCOMMIT; request a real transaction so all tables change together.
+        isolation_level = "SERIALIZABLE" if self.db.url.startswith("sqlite:") else "READ COMMITTED"
+        with self.db.engine.connect().execution_options(isolation_level=isolation_level) as connection:
+            with connection.begin():
+                for name in tables:
+                    tbl = getattr(self.db.tbl, name)
+                    where = tbl.c.permission.in_(permissions)
+                    if not permissions:
+                        result[name] = 0
+                    elif dry_run:
+                        result[name] = connection.execute(
+                            select(func.count()).select_from(tbl).where(where)
+                        ).scalar()
+                    else:
+                        result[name] = connection.execute(tbl.delete().where(where)).rowcount
+        return {"dry_run": bool(dry_run), "deleted": result}
 
     @web.rpc("auth_insert_permissions", "insert_permissions")
     def insert_permissions(self, permissions: tuple[str, str, str]):  # pylint: disable=R1711
