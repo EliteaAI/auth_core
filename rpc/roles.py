@@ -75,6 +75,7 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_add_role", "add_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def add_role(self, name: str, mode: str = "administration") -> int:
+        rpc_tools.validate_mode(mode)
         with self.db.engine.connect() as connection:
             return connection.execute(
                 self.db.tbl.role.insert().values(
@@ -112,6 +113,7 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_update_role_name", "update_role_name")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def update_role_name(self, old_name: str, new_name: str, mode: str = "administration") -> int:
+        rpc_tools.validate_mode(mode)
         with self.db.engine.connect() as connection:
             data = connection.execute(
                 self.db.tbl.role.update().where(
@@ -129,6 +131,7 @@ class RPC:  # pylint: disable=R0903,E1101
                             role_name: str,
                             mode: str = 'administration',
                             project_id: Optional[int] = None) -> None:
+        rpc_tools.validate_mode(mode)
         #
         rpc_timeout = self.descriptor.config.get("rpc_timeout", 120)
         #
@@ -228,6 +231,7 @@ class RPC:  # pylint: disable=R0903,E1101
     @web.rpc("auth_set_permission_for_role", "set_permission_for_role")
     def set_permission_for_role(self, role_name: str, permission_name: str,  # pylint: disable=W0613
                                 mode: str = "administration", **kwargs) -> None:
+        rpc_tools.validate_mode(mode)
         with self.db.engine.connect() as connection:
             # role_id = connection.execute(
             #     self.db.tbl.role.select().where(
@@ -300,6 +304,10 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_insert_permissions", "insert_permissions")
     def insert_permissions(self, permissions: tuple[str, str, str]):  # pylint: disable=R1711
+        # Older auth still sends developer tuples; their roles are gone and a NULL role_id would fail the batch.
+        permissions = [row for row in permissions if row[1] in rpc_tools.ROLE_MODES]
+        if not permissions:
+            return None
         if self.db.url.startswith("sqlite:"):
             from sqlalchemy.dialects.sqlite import insert  # pylint: disable=E0401,C0415
         else:  # postgresql:

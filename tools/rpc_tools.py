@@ -20,6 +20,14 @@
 import functools
 import traceback
 
+ROLE_MODES = ("administration", "default")
+
+
+def validate_mode(mode):
+    """ Reject role modes the platform does not define """
+    if mode not in ROLE_MODES:
+        raise ValueError(f"Unknown role mode {mode!r}, expected one of {ROLE_MODES}")
+
 
 def wrap_exceptions(target_exception):
     """ Wrap exceptions into generic exception (for RPC transport) """
