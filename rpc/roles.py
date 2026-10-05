@@ -304,6 +304,10 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_insert_permissions", "insert_permissions")
     def insert_permissions(self, permissions: tuple[str, str, str]):  # pylint: disable=R1711
+        # Older auth still sends developer tuples; their roles are gone and a NULL role_id would fail the batch.
+        permissions = [row for row in permissions if row[1] in rpc_tools.ROLE_MODES]
+        if not permissions:
+            return None
         if self.db.url.startswith("sqlite:"):
             from sqlalchemy.dialects.sqlite import insert  # pylint: disable=E0401,C0415
         else:  # postgresql:
