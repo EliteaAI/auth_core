@@ -30,7 +30,7 @@ project admin made on their own (e.g. to a custom role) after this ran.
 """
 
 revision = "202610051200"
-down_revision = "202610021500"
+down_revision = "202609251200"
 branch_labels = None
 
 from alembic import op  # pylint: disable=E0401,C0413
