@@ -27,7 +27,7 @@ import sqlalchemy as sa
 
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
-from ..tools import rpc_tools
+from ..tools import rpc_tools, revocation
 from ..db import db_tools
 
 
@@ -95,7 +95,46 @@ class RPC:  # pylint: disable=R0903,E1101
             )
         #
         with self.db.engine.connect() as connection:
-            return connection.execute(query).rowcount
+            deleted = connection.execute(query).rowcount
+        # No epoch to bump: the row is gone, and a missing token denies on its own.
+        if deleted:
+            revocation.fire_invalidate(self.context, "token", token_id, None)
+        #
+        return deleted
+
+    @web.rpc("auth_set_token_expiry", "set_token_expiry")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def set_token_expiry(
+            self,
+            token_id: int,
+            expires: Optional[datetime.datetime],
+    ):
+        """ Change a token's expiry and revoke what caches know about it
+
+        This is how rotation retires a predecessor: it stays valid until
+        `expires` instead of forever. The expiry and the epoch bump commit
+        together, so a cache entry built before the change can never be
+        mistaken for current. System tokens are refused (the guard is in the
+        WHERE clause, like delete_token): their invariant is "never expires".
+        Returns the new epoch, or None if no such (non-system) token.
+        """
+        tbl = self.db.tbl.token
+        #
+        with revocation.transaction(self.db) as connection:
+            updated = connection.execute(
+                tbl.update().where(
+                    tbl.c.id == token_id,
+                    tbl.c.name != SYSTEM_TOKEN_NAME,
+                ).values(expires=expires)
+            ).rowcount
+            #
+            epoch = revocation.bump_epoch(connection, self.db, "token", token_id) \
+                if updated else None
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "token", token_id, epoch)
+        #
+        return epoch
 
     @web.rpc("auth_get_token", "get_token")
     @rpc_tools.wrap_exceptions(RuntimeError)

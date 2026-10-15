@@ -27,7 +27,7 @@ from sqlalchemy import func, or_, case, asc, desc
 from sqlalchemy.exc import NoResultFound
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
-from ..tools import rpc_tools
+from ..tools import rpc_tools, revocation
 from ..db import db_tools
 from .tokens import SYSTEM_TOKEN_NAME
 
@@ -88,8 +88,10 @@ class RPC:  # pylint: disable=R0903,E1101
             values["last_login"] = last_login
         if suspended is not None:
             values["suspended"] = suspended
-        with self.db.engine.connect() as connection:
-            return connection.execute(
+        #
+        epoch = None
+        with revocation.transaction(self.db) as connection:
+            result = connection.execute(
                 self.db.tbl.user.update().where(
                     self.db.tbl.user.c.id == id_
                 ).values(**values
@@ -98,16 +100,32 @@ class RPC:  # pylint: disable=R0903,E1101
                     self.db.tbl.user.c.name
                 )
             ).first()
+            # A suspension change must reach every cache; it is bumped in the same
+            # transaction so nobody sees the new state under the old epoch.
+            if suspended is not None and result is not None:
+                epoch = revocation.bump_epoch(connection, self.db, "user", id_)
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", id_, epoch)
+        #
+        return result
 
     @web.rpc("auth_delete_user", "delete_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def delete_user(self, user_id: int):
         with self.db.engine.connect() as connection:
-            return connection.execute(
+            deleted = connection.execute(
                 self.db.tbl.user.delete().where(
                     self.db.tbl.user.c.id == user_id
                 )
             ).rowcount
+        # The row (and its tokens, by cascade) is gone, so there is no epoch left
+        # to bump: absence reads back as "no such user" and denies. The event only
+        # makes caches drop the user now.
+        if deleted:
+            revocation.fire_invalidate(self.context, "user", user_id, None)
+        #
+        return deleted
 
     @web.rpc("auth_get_user", "get_user")
     @rpc_tools.wrap_exceptions(RuntimeError)

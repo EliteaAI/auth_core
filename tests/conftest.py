@@ -38,9 +38,37 @@ def credential_handlers(plugin_root: pathlib.Path):
 
 
 @pytest.fixture(scope="session")
+def revocation_rpc(plugin_root: pathlib.Path):
+    """The rpc/revocation.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.revocation")
+
+
+@pytest.fixture(scope="session")
+def roles(plugin_root: pathlib.Path):
+    """The rpc/roles.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.roles")
+
+
+@pytest.fixture(scope="session")
+def project_roles(plugin_root: pathlib.Path):
+    """The rpc/project_roles.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.project_roles")
+
+
+@pytest.fixture(scope="session")
 def users(plugin_root: pathlib.Path):
     """The rpc/users.py module under test."""
     return helpers.import_plugin_module(plugin_root, "rpc.users")
+
+
+class RecordingEvents:
+    """The event manager: remembers what was fired, in order."""
+
+    def __init__(self):
+        self.fired = []
+
+    def fire_event(self, name, payload=None):
+        self.fired.append((name, payload))
 
 
 def define_tables(metadata: sa.MetaData) -> tuple:
@@ -60,6 +88,11 @@ def define_tables(metadata: sa.MetaData) -> tuple:
             index=True,
         ),
         sa.Column("name", sa.Text),
+        # From migration 202610151200 (C-1009, #6944).
+        sa.Column(
+            "revocation_epoch", sa.BigInteger, nullable=False,
+            server_default=sa.text("0"),
+        ),
     )
     user = sa.Table(
         f"{TABLE_PREFIX}__user", metadata,
@@ -70,6 +103,10 @@ def define_tables(metadata: sa.MetaData) -> tuple:
         sa.Column(
             "suspended", sa.Boolean, nullable=False,
             server_default=sa.text("false"),
+        ),
+        sa.Column(
+            "revocation_epoch", sa.BigInteger, nullable=False,
+            server_default=sa.text("0"),
         ),
     )
     return token, user
@@ -103,7 +140,7 @@ def engine(tmp_path) -> sa.Engine:
 
 
 @pytest.fixture
-def rpc(tokens, credential_handlers, users, engine):
+def rpc(tokens, credential_handlers, users, revocation_rpc, engine):
     """A token RPC bound to a real engine, shaped like the live module.
 
     Pylon merges every rpc/*.py RPC class into one module instance, so the
@@ -116,7 +153,9 @@ def rpc(tokens, credential_handlers, users, engine):
     metadata.create_all(engine)
     create_system_token_index(engine)
 
-    class Subject(tokens.RPC, credential_handlers.RPC, users.RPC):
+    class Subject(
+            tokens.RPC, credential_handlers.RPC, users.RPC, revocation_rpc.RPC,
+    ):
         pass
 
     subject = Subject()
@@ -125,8 +164,10 @@ def rpc(tokens, credential_handlers, users, engine):
         url=str(engine.url),
         tbl=types.SimpleNamespace(token=token_tbl, user=user_tbl),
     )
+    subject.events = RecordingEvents()
     subject.context = types.SimpleNamespace(
         app=types.SimpleNamespace(secret_key=SECRET_KEY),
+        event_manager=subject.events,
     )
     subject.tbl = subject.db.tbl
 
