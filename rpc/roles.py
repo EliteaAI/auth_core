@@ -25,7 +25,7 @@ from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
 from sqlalchemy import select, bindparam, and_, func  # pylint: disable=E0401
 
-from ..tools import rpc_tools
+from ..tools import rpc_tools, revocation
 from ..db import db_tools
 
 
@@ -144,7 +144,7 @@ class RPC:  # pylint: disable=R0903,E1101
                     role_names=[role_name]
                 )
             case _:
-                with self.db.engine.connect() as connection:
+                with revocation.transaction(self.db) as connection:
                     # Remove existing roles in this mode first (enforce single role)
                     existing_role_ids = [
                         row['id'] for row in connection.execute(
@@ -173,13 +173,17 @@ class RPC:  # pylint: disable=R0903,E1101
                             role_id=role_id,
                         )
                     )
+                    epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+                #
+                if epoch is not None:
+                    revocation.fire_invalidate(self.context, "user", user_id, epoch)
 
     @web.rpc("auth_remove_user_from_role", "remove_user_from_role")
     def remove_user_from_role(self,
                               user_id: int,
                               role_name: str,
                               mode: str = 'administration') -> None:
-        with self.db.engine.connect() as connection:
+        with revocation.transaction(self.db) as connection:
             role = connection.execute(
                 self.db.tbl.role.select().where(
                     self.db.tbl.role.c.name == role_name,
@@ -196,6 +200,10 @@ class RPC:  # pylint: disable=R0903,E1101
                     self.db.tbl.user_role.c.role_id == role['id'],
                 )
             )
+            epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, epoch)
 
     @web.rpc("auth_get_permissions", "get_permissions")
     def get_permissions(self, mode="administration"):
