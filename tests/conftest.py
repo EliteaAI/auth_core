@@ -108,6 +108,10 @@ def define_tables(metadata: sa.MetaData) -> tuple:
             "revocation_epoch", sa.BigInteger, nullable=False,
             server_default=sa.text("0"),
         ),
+        # From migration 202610160900 (C-1009, #6941).
+        sa.Column("idp_issuer", sa.Text, nullable=True),
+        sa.Column("idp_tid", sa.Text, nullable=True),
+        sa.Column("idp_oid", sa.Text, nullable=True),
     )
     return token, user
 
@@ -123,6 +127,21 @@ def create_system_token_index(engine: sa.Engine) -> None:
         connection.execute(sa.text(
             f"CREATE UNIQUE INDEX uq_{TABLE_PREFIX}__token_system_per_user "
             f"ON {TABLE_PREFIX}__token (user_id) WHERE name = 'elitea-system'"
+        ))
+
+
+def create_idp_subject_index(engine: sa.Engine) -> None:
+    """The partial unique index that migration 202610160900 adds.
+
+    Declared here for the same reason as the system token index above;
+    test_idp_subject_migration asserts the migration produces the same index.
+    """
+    with engine.connect() as connection:
+        connection.execute(sa.text(
+            f"CREATE UNIQUE INDEX uq_{TABLE_PREFIX}__user_idp_subject "
+            f"ON {TABLE_PREFIX}__user (idp_issuer, idp_tid, idp_oid) "
+            "WHERE idp_issuer IS NOT NULL AND idp_tid IS NOT NULL "
+            "AND idp_oid IS NOT NULL"
         ))
 
 
@@ -152,6 +171,7 @@ def rpc(tokens, credential_handlers, users, revocation_rpc, engine):
     token_tbl, user_tbl = define_tables(metadata)
     metadata.create_all(engine)
     create_system_token_index(engine)
+    create_idp_subject_index(engine)
 
     class Subject(
             tokens.RPC, credential_handlers.RPC, users.RPC, revocation_rpc.RPC,
