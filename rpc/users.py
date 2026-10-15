@@ -32,6 +32,13 @@ from ..db import db_tools
 from .tokens import SYSTEM_TOKEN_NAME
 
 
+def _check_idp_subject(issuer, tid, oid):
+    """ A subject is all three parts, each a non-empty string """
+    for name, value in (("issuer", issuer), ("tid", tid), ("oid", oid)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"IdP subject needs a non-empty {name}")
+
+
 class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_add_user", "add_user")
@@ -167,6 +174,75 @@ class RPC:  # pylint: disable=R0903,E1101
             raise RuntimeError("No such user found") from None
         #
         raise ValueError("ID or name is not provided")
+
+    @web.rpc("auth_get_user_by_idp_subject", "get_user_by_idp_subject")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def get_user_by_idp_subject(self, issuer: str, tid: str, oid: str) -> Optional[dict]:
+        """ The user that carries this IdP subject, None if nobody does """
+        _check_idp_subject(issuer, tid, oid)
+        #
+        tbl = self.db.tbl.user
+        with self.db.engine.connect() as connection:
+            user = connection.execute(
+                tbl.select().where(
+                    tbl.c.idp_issuer == issuer,
+                    tbl.c.idp_tid == tid,
+                    tbl.c.idp_oid == oid,
+                )
+            ).mappings().first()
+        #
+        return None if user is None else db_tools.sqlalchemy_mapping_to_dict(user)
+
+    @web.rpc("auth_set_user_idp_subject", "set_user_idp_subject")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def set_user_idp_subject(self, user_id: int, issuer: str, tid: str, oid: str) -> bool:
+        """ Link a user to an IdP subject, once
+
+        True if the subject was written, False if the user already carried exactly
+        this subject. Raises if the user carries a different one (a subject is
+        immutable: re-pointing an account is a decision for an operator, not for a
+        sign-in), if the user does not exist, or if another user already carries it.
+
+        The write is conditional on the user having no subject, so two concurrent
+        sign-ins cannot both link. It bumps the user's revocation epoch: cached
+        entries built before the link are dropped.
+        """
+        _check_idp_subject(issuer, tid, oid)
+        #
+        tbl = self.db.tbl.user
+        no_subject = sqlalchemy.and_(
+            tbl.c.idp_issuer.is_(None),
+            tbl.c.idp_tid.is_(None),
+            tbl.c.idp_oid.is_(None),
+        )
+        #
+        epoch = None
+        with revocation.transaction(self.db) as connection:
+            linked = connection.execute(
+                tbl.update().where(
+                    tbl.c.id == user_id, no_subject,
+                ).values(idp_issuer=issuer, idp_tid=tid, idp_oid=oid)
+            ).rowcount
+            #
+            if linked:
+                epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+            else:
+                current = connection.execute(
+                    sqlalchemy.select(
+                        tbl.c.idp_issuer, tbl.c.idp_tid, tbl.c.idp_oid,
+                    ).where(tbl.c.id == user_id)
+                ).first()
+                if current is None:
+                    raise ValueError(f"No such user found: id={user_id}")
+                if tuple(current) != (issuer, tid, oid):
+                    raise ValueError(
+                        f"User {user_id} is already linked to a different IdP subject"
+                    )
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        #
+        return bool(linked)
 
     @web.rpc("auth_list_users", "list_users")
     @rpc_tools.wrap_exceptions(RuntimeError)
