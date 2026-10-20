@@ -287,7 +287,21 @@ def test_el_7011_r3_2_downgrade_removes_ledger_rows_and_drops_ledger(
     assert not sa.inspect(engine).has_table(LEDGER)
 
 
-def test_el_7011_r3_2_downgrade_keeps_a_later_admin_grant(db, upgrade, downgrade):
+def test_el_7011_r3_2_downgrade_keeps_a_row_seeded_before_upgrade(
+        db, upgrade, downgrade,
+):
+    db.grant(1, "editor", AGENT_CREATE, PREFIX + "run")
+    upgrade()
+
+    downgrade()
+
+    # A delete by permission name would also remove this pre-existing row.
+    assert db.perms(1, "editor") == [PREFIX + "run"]
+
+
+def test_el_7011_r3_2_downgrade_keeps_a_list_grant_made_after_upgrade(
+        db, upgrade, downgrade,
+):
     db.grant(1, "editor", AGENT_CREATE)
     upgrade()
     db.grant(1, "reviewer", PREFIX + "list")
