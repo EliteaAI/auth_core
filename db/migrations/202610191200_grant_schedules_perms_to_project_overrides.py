@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-# coding=utf-8
 # pylint: disable=C0103,C0116
 
 #   Copyright 2026 EPAM Systems
@@ -31,11 +29,9 @@ revision = "202610191200"
 down_revision = "202610051500"
 branch_labels = None
 
-from alembic import op  # pylint: disable=E0401,C0413
 import sqlalchemy as sa  # pylint: disable=E0401,C0413
-
+from alembic import op  # pylint: disable=E0401,C0413
 from pylon.core.tools import log  # pylint: disable=E0401,C0413
-
 
 SCHEDULE_USER_PERMISSIONS = [
     "models.applications.schedules.list",
@@ -78,7 +74,6 @@ def _grant(bind, module_name, source, permissions, **params):
         RETURNING id
         """
     ).bindparams(*[sa.bindparam(name, expanding=True) for name in params])
-    #
     inserted_ids = []
     for permission in permissions:
         inserted_ids += bind.execute(
