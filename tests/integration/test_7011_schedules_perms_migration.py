@@ -11,7 +11,6 @@ import types
 
 import pytest
 import sqlalchemy as sa
-
 from conftest import TABLE_PREFIX
 from fixtures import helpers
 
