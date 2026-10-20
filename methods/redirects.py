@@ -24,6 +24,25 @@ import flask  # pylint: disable=E0401
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
 
+def context_belongs_to_provider(auth_ctx, get_user_from_provider) -> bool:
+    """A provider login may name only the user its own provider reference maps to.
+
+    Providers build a fresh context, so ``user_id`` is either unset (first login) or the
+    user ``get_user_from_provider(nameid)`` returns. Anything else is a stale or foreign
+    session user and must not be carried into the processors.
+    """
+    user_id = auth_ctx.get("user_id")
+    if user_id is None:
+        return True
+    nameid = (auth_ctx.get("provider_attr") or {}).get("nameid")
+    if not nameid:
+        return False
+    try:
+        return get_user_from_provider(nameid)["id"] == user_id
+    except Exception:  # pylint: disable=W0703  # no mapping for this reference
+        return False
+
+
 class Method:  # pylint: disable=E1101,R0903
     """
         Method Resource
@@ -91,6 +110,10 @@ class Method:  # pylint: disable=E1101,R0903
     def access_success_redirect(self, target_token):
         """ Client: auth OK redirect """
         auth_ctx = self.get_auth_context()
+        #
+        if not context_belongs_to_provider(auth_ctx, self.get_user_from_provider):
+            log.error("Login denied: auth context names a user outside its provider identity")
+            return self.access_denied_reply()
         #
         for processor_endpoint in self.auth_processors:
             processor_rpc = getattr(
