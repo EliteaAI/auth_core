@@ -113,7 +113,7 @@ class Method:  # pylint: disable=E1101,R0903
         #
         if not context_belongs_to_provider(auth_ctx, self.get_user_from_provider):
             log.error("Login denied: auth context names a user outside its provider identity")
-            return self.access_denied_reply()
+            return self.login_denied_reply()
         #
         for processor_endpoint in self.auth_processors:
             processor_rpc = getattr(
@@ -124,7 +124,13 @@ class Method:  # pylint: disable=E1101,R0903
                 auth_ctx = processor_rpc(auth_ctx)
             except:  # pylint: disable=W0702
                 log.exception("Processor failed")
-                return self.access_denied_reply()
+                return self.login_denied_reply()
+        #
+        # A finished login names its user. No processor registered, or one that returned
+        # nothing / a context without a user, would otherwise store "done" with no user.
+        if not isinstance(auth_ctx, dict) or auth_ctx.get("user_id") is None:
+            log.error("Login denied: no processor named the user of this login")
+            return self.login_denied_reply()
         #
         flask.session.regenerate()
         self.set_auth_context(auth_ctx)
@@ -135,6 +141,26 @@ class Method:  # pylint: disable=E1101,R0903
             target_url = self.descriptor.config.get("default_login_url", "/")
         #
         return flask.redirect(target_url)
+
+    @web.method()
+    def login_denied_reply(self):
+        """ Client: a login was refused after its provider had already written the auth context
+
+        Providers store ``done=True`` (and, for a first login, ``user_id=None``) before the
+        processors run. Left in place, a refused login would be a session that is "done" with
+        no user: every API then sees auth id "-". The context is cleared and the session is
+        dropped like on logout, so neither it nor the user of the session it replaced survives.
+
+        Only refusals at this stage (a processor, the provider-identity check, a processor
+        that names no user) get here. A provider refusing earlier (bad state, token errors,
+        missing ``sub``, unverified e-mail, wrong form password) never reaches it and leaves
+        the previous session as it was.
+        """
+        self.set_auth_context({})  # in memory first: the session store may be unreachable
+        flask.session.destroy()
+        flask.session.regenerate()
+        #
+        return self.access_denied_reply()
 
     @web.method()
     def logout_needed_redirect(self, target_token):

@@ -50,6 +50,18 @@ class Method:  # pylint: disable=E1101,R0903
         }
 
     @web.method()
+    def drop_userless_done(self, auth_context):
+        """ A finished login names its user: "done" without one is not an authenticated session
+
+        Sessions written by a refused login before #7121 was fixed stay in the store like
+        this until they expire; read as unauthenticated, they heal on the next request.
+        """
+        if auth_context.get("done") and auth_context.get("user_id") is None:
+            return {**auth_context, "done": False}
+        #
+        return auth_context
+
+    @web.method()
     def set_auth_context(self, auth_context, session=None):
         """ Save current auth context in session """
         if session is None:
