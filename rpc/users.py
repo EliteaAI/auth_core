@@ -230,7 +230,10 @@ class RPC:  # pylint: disable=R0903,E1101
         ``MAX_IDP_SUBJECTS_PER_CALL`` (more is refused). Returns
         ``{f"{tid}:{oid}": user}`` where ``user`` is exactly what
         ``get_user_by_idp_subject`` returns; a subject nobody carries is absent.
-        The same lookup as the single RPC, batched: it reveals nothing more.
+        The same lookup as the single RPC, batched: it reveals nothing more. A bad
+        issuer, a malformed subject or more than ``MAX_IDP_SUBJECTS_PER_CALL``
+        subjects is refused before any query, surfacing as the same ``RuntimeError``
+        wrapping as the single RPC's validation errors.
         """
         pairs = _check_idp_subjects(issuer, subjects)
         if not pairs:

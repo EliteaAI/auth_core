@@ -65,12 +65,14 @@ def test_each_user_has_exactly_the_shape_of_the_single_lookup(rpc):
     assert found[f"{TID}:{oid(1)}"] == rpc.get_user_by_idp_subject(ISSUER, TID, oid(1))
 
 
-def test_a_user_row_carries_no_credential_material(rpc):
-    add_user(rpc, 1, subject_oid=oid(1))
+def test_a_user_has_exactly_the_public_keys_and_no_credential_material(rpc):
+    add_user(rpc, 1, subject_oid=oid(1), name="Ann")
 
     user = rpc.get_users_by_idp_subjects(ISSUER, [subject(1)])[f"{TID}:{oid(1)}"]
 
-    assert not {key for key in user if "pass" in key or "token" in key or "secret" in key}
+    assert set(user) == {
+        "id", "email", "name", "suspended", "revocation_epoch", "idp_issuer", "idp_tid", "idp_oid",
+    }
 
 
 def test_subjects_of_different_tenants_are_told_apart(rpc):
