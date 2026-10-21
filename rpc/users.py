@@ -39,6 +39,31 @@ def _check_idp_subject(issuer, tid, oid):
             raise ValueError(f"IdP subject needs a non-empty {name}")
 
 
+# Most subjects one auth_get_users_by_idp_subjects call accepts. A larger request is
+# refused (not chunked here): the caller already holds the list and splits it, so the
+# one-statement-per-call property is a guarantee instead of a best effort.
+MAX_IDP_SUBJECTS_PER_CALL = 200
+
+
+def _check_idp_subjects(issuer, subjects):
+    """ The issuer is a non-empty string, subjects a bounded list of {tid, oid} """
+    if not isinstance(issuer, str) or not issuer:
+        raise ValueError("IdP subject needs a non-empty issuer")
+    if not isinstance(subjects, (list, tuple)):
+        raise ValueError("subjects must be a list of {tid, oid}")
+    if len(subjects) > MAX_IDP_SUBJECTS_PER_CALL:
+        raise ValueError(
+            f"At most {MAX_IDP_SUBJECTS_PER_CALL} subjects per call, got {len(subjects)}"
+        )
+    pairs = []
+    for item in subjects:
+        if not isinstance(item, dict) or set(item) != {"tid", "oid"}:
+            raise ValueError("Each subject must be a dict with exactly tid and oid")
+        _check_idp_subject(issuer, item["tid"], item["oid"])
+        pairs.append((item["tid"], item["oid"]))
+    return list(dict.fromkeys(pairs))
+
+
 class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_add_user", "add_user")
@@ -195,6 +220,38 @@ class RPC:  # pylint: disable=R0903,E1101
             ).mappings().first()
         #
         return None if user is None else db_tools.sqlalchemy_mapping_to_dict(user)
+
+    @web.rpc("auth_get_users_by_idp_subjects", "get_users_by_idp_subjects")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def get_users_by_idp_subjects(self, issuer: str, subjects: list) -> dict:
+        """ Users carrying the given IdP subjects of one issuer, in one query
+
+        ``subjects`` is a list of ``{"tid": ..., "oid": ...}``, at most
+        ``MAX_IDP_SUBJECTS_PER_CALL`` (more is refused). Returns
+        ``{f"{tid}:{oid}": user}`` where ``user`` is exactly what
+        ``get_user_by_idp_subject`` returns; a subject nobody carries is absent.
+        The same lookup as the single RPC, batched: it reveals nothing more. A bad
+        issuer, a malformed subject or more than ``MAX_IDP_SUBJECTS_PER_CALL``
+        subjects is refused before any query, surfacing as the same ``RuntimeError``
+        wrapping as the single RPC's validation errors.
+        """
+        pairs = _check_idp_subjects(issuer, subjects)
+        if not pairs:
+            return {}
+        #
+        tbl = self.db.tbl.user
+        with self.db.engine.connect() as connection:
+            rows = connection.execute(
+                tbl.select().where(
+                    tbl.c.idp_issuer == issuer,
+                    sqlalchemy.tuple_(tbl.c.idp_tid, tbl.c.idp_oid).in_(pairs),
+                )
+            ).mappings().all()
+        #
+        return {
+            f"{row['idp_tid']}:{row['idp_oid']}": db_tools.sqlalchemy_mapping_to_dict(row)
+            for row in rows
+        }
 
     @web.rpc("auth_set_user_idp_subject", "set_user_idp_subject")
     @rpc_tools.wrap_exceptions(RuntimeError)
