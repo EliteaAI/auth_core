@@ -126,6 +126,12 @@ class Method:  # pylint: disable=E1101,R0903
                 log.exception("Processor failed")
                 return self.login_denied_reply()
         #
+        # A finished login names its user. No processor registered, or one that returned
+        # nothing / a context without a user, would otherwise store "done" with no user.
+        if not isinstance(auth_ctx, dict) or auth_ctx.get("user_id") is None:
+            log.error("Login denied: no processor named the user of this login")
+            return self.login_denied_reply()
+        #
         flask.session.regenerate()
         self.set_auth_context(auth_ctx)
         #
@@ -142,12 +148,17 @@ class Method:  # pylint: disable=E1101,R0903
 
         Providers store ``done=True`` (and, for a first login, ``user_id=None``) before the
         processors run. Left in place, a refused login would be a session that is "done" with
-        no user: every API then sees auth id "-". The session is dropped like on logout, so
-        neither that context nor the user of the session it replaced survives.
+        no user: every API then sees auth id "-". The context is cleared and the session is
+        dropped like on logout, so neither it nor the user of the session it replaced survives.
+
+        Only refusals at this stage (a processor, the provider-identity check, a processor
+        that names no user) get here. A provider refusing earlier (bad state, token errors,
+        missing ``sub``, unverified e-mail, wrong form password) never reaches it and leaves
+        the previous session as it was.
         """
+        self.set_auth_context({})  # in memory first: the session store may be unreachable
         flask.session.destroy()
         flask.session.regenerate()
-        self.set_auth_context({})
         #
         return self.access_denied_reply()
 

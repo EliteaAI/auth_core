@@ -103,7 +103,7 @@ class Route:  # pylint: disable=E1101,R0903
                     source, auth_type, auth_id, auth_reference
                 )
         # Browser auth
-        auth_ctx = self.get_auth_context()
+        auth_ctx = self.drop_userless_done(self.get_auth_context())
         if auth_ctx["done"] and \
                 (
                         auth_ctx["expiration"] is None or
@@ -113,8 +113,7 @@ class Route:  # pylint: disable=E1101,R0903
             return self.access_success_reply(
                 source,
                 auth_type="user",
-                auth_id=str(auth_ctx["user_id"]) \
-                    if auth_ctx["user_id"] is not None else "-",
+                auth_id=str(auth_ctx["user_id"]),
                 auth_reference=flask.request.cookies.get(
                     self.context.app.session_cookie_name, "-"
                 ),
