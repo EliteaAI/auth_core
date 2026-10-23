@@ -1,4 +1,4 @@
-"""R3.4 of EL-7011: the revision chain keeps one head, with 202610191200 on top of 202610051500."""
+"""R3.4 of EL-7011: the revision chain keeps one head, with 202610191200 on top of 202610160900."""
 import ast
 import pathlib
 import shutil
@@ -6,7 +6,7 @@ import shutil
 import pytest
 
 NEW_REVISION = "202610191200"
-PARENT_REVISION = "202610051500"
+PARENT_REVISION = "202610160900"
 
 
 def read_links(folder: pathlib.Path) -> dict:
