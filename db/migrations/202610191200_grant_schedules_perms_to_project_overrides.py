@@ -26,7 +26,7 @@ exactly those rows and keeps grants a project admin made later.
 """
 
 revision = "202610191200"
-down_revision = "202610051500"
+down_revision = "202610160900"
 branch_labels = None
 
 import sqlalchemy as sa  # pylint: disable=E0401,C0413
