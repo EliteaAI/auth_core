@@ -38,9 +38,37 @@ def credential_handlers(plugin_root: pathlib.Path):
 
 
 @pytest.fixture(scope="session")
+def revocation_rpc(plugin_root: pathlib.Path):
+    """The rpc/revocation.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.revocation")
+
+
+@pytest.fixture(scope="session")
+def roles(plugin_root: pathlib.Path):
+    """The rpc/roles.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.roles")
+
+
+@pytest.fixture(scope="session")
+def project_roles(plugin_root: pathlib.Path):
+    """The rpc/project_roles.py module under test."""
+    return helpers.import_plugin_module(plugin_root, "rpc.project_roles")
+
+
+@pytest.fixture(scope="session")
 def users(plugin_root: pathlib.Path):
     """The rpc/users.py module under test."""
     return helpers.import_plugin_module(plugin_root, "rpc.users")
+
+
+class RecordingEvents:
+    """The event manager: remembers what was fired, in order."""
+
+    def __init__(self):
+        self.fired = []
+
+    def fire_event(self, name, payload=None):
+        self.fired.append((name, payload))
 
 
 def define_tables(metadata: sa.MetaData) -> tuple:
@@ -60,6 +88,11 @@ def define_tables(metadata: sa.MetaData) -> tuple:
             index=True,
         ),
         sa.Column("name", sa.Text),
+        # From migration 202610151200 (C-1009, #6944).
+        sa.Column(
+            "revocation_epoch", sa.BigInteger, nullable=False,
+            server_default=sa.text("0"),
+        ),
     )
     user = sa.Table(
         f"{TABLE_PREFIX}__user", metadata,
@@ -71,6 +104,14 @@ def define_tables(metadata: sa.MetaData) -> tuple:
             "suspended", sa.Boolean, nullable=False,
             server_default=sa.text("false"),
         ),
+        sa.Column(
+            "revocation_epoch", sa.BigInteger, nullable=False,
+            server_default=sa.text("0"),
+        ),
+        # From migration 202610160900 (C-1009, #6941).
+        sa.Column("idp_issuer", sa.Text, nullable=True),
+        sa.Column("idp_tid", sa.Text, nullable=True),
+        sa.Column("idp_oid", sa.Text, nullable=True),
     )
     return token, user
 
@@ -89,6 +130,21 @@ def create_system_token_index(engine: sa.Engine) -> None:
         ))
 
 
+def create_idp_subject_index(engine: sa.Engine) -> None:
+    """The partial unique index that migration 202610160900 adds.
+
+    Declared here for the same reason as the system token index above;
+    test_idp_subject_migration asserts the migration produces the same index.
+    """
+    with engine.connect() as connection:
+        connection.execute(sa.text(
+            f"CREATE UNIQUE INDEX uq_{TABLE_PREFIX}__user_idp_subject "
+            f"ON {TABLE_PREFIX}__user (idp_issuer, idp_tid, idp_oid) "
+            "WHERE idp_issuer IS NOT NULL AND idp_tid IS NOT NULL "
+            "AND idp_oid IS NOT NULL"
+        ))
+
+
 @pytest.fixture
 def engine(tmp_path) -> sa.Engine:
     """File-backed SQLite in AUTOCOMMIT, as auth_core's engine runs.
@@ -103,7 +159,7 @@ def engine(tmp_path) -> sa.Engine:
 
 
 @pytest.fixture
-def rpc(tokens, credential_handlers, users, engine):
+def rpc(tokens, credential_handlers, users, revocation_rpc, engine):
     """A token RPC bound to a real engine, shaped like the live module.
 
     Pylon merges every rpc/*.py RPC class into one module instance, so the
@@ -115,8 +171,11 @@ def rpc(tokens, credential_handlers, users, engine):
     token_tbl, user_tbl = define_tables(metadata)
     metadata.create_all(engine)
     create_system_token_index(engine)
+    create_idp_subject_index(engine)
 
-    class Subject(tokens.RPC, credential_handlers.RPC, users.RPC):
+    class Subject(
+            tokens.RPC, credential_handlers.RPC, users.RPC, revocation_rpc.RPC,
+    ):
         pass
 
     subject = Subject()
@@ -125,8 +184,10 @@ def rpc(tokens, credential_handlers, users, engine):
         url=str(engine.url),
         tbl=types.SimpleNamespace(token=token_tbl, user=user_tbl),
     )
+    subject.events = RecordingEvents()
     subject.context = types.SimpleNamespace(
         app=types.SimpleNamespace(secret_key=SECRET_KEY),
+        event_manager=subject.events,
     )
     subject.tbl = subject.db.tbl
 
