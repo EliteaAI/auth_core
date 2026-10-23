@@ -80,10 +80,13 @@ class RPC:  # pylint: disable=R0903,E1101
             name: Optional[str] = '',
             last_login: Optional[datetime.datetime] = None,
             suspended: Optional[bool] = None,
+            email: Optional[str] = None,
     ):
         values = {}
         if name:
             values['name'] = name
+        if email:
+            values["email"] = email.lower()
         if last_login:
             values["last_login"] = last_login
         if suspended is not None:
