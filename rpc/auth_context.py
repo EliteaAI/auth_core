@@ -39,7 +39,7 @@ class RPC:  # pylint: disable=R0903,E1101
                 self.context.app, request,
             )
         #
-        return self.get_auth_context(session)
+        return self.drop_userless_done(self.get_auth_context(session))
 
     @web.rpc("auth_set_referenced_auth_context", "set_referenced_auth_context")
     @rpc_tools.wrap_exceptions(RuntimeError)

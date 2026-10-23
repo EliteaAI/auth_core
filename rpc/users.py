@@ -27,9 +27,41 @@ from sqlalchemy import func, or_, case, asc, desc
 from sqlalchemy.exc import NoResultFound
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
-from ..tools import rpc_tools
+from ..tools import rpc_tools, revocation
 from ..db import db_tools
 from .tokens import SYSTEM_TOKEN_NAME
+
+
+def _check_idp_subject(issuer, tid, oid):
+    """ A subject is all three parts, each a non-empty string """
+    for name, value in (("issuer", issuer), ("tid", tid), ("oid", oid)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"IdP subject needs a non-empty {name}")
+
+
+# Most subjects one auth_get_users_by_idp_subjects call accepts. A larger request is
+# refused (not chunked here): the caller already holds the list and splits it, so the
+# one-statement-per-call property is a guarantee instead of a best effort.
+MAX_IDP_SUBJECTS_PER_CALL = 200
+
+
+def _check_idp_subjects(issuer, subjects):
+    """ The issuer is a non-empty string, subjects a bounded list of {tid, oid} """
+    if not isinstance(issuer, str) or not issuer:
+        raise ValueError("IdP subject needs a non-empty issuer")
+    if not isinstance(subjects, (list, tuple)):
+        raise ValueError("subjects must be a list of {tid, oid}")
+    if len(subjects) > MAX_IDP_SUBJECTS_PER_CALL:
+        raise ValueError(
+            f"At most {MAX_IDP_SUBJECTS_PER_CALL} subjects per call, got {len(subjects)}"
+        )
+    pairs = []
+    for item in subjects:
+        if not isinstance(item, dict) or set(item) != {"tid", "oid"}:
+            raise ValueError("Each subject must be a dict with exactly tid and oid")
+        _check_idp_subject(issuer, item["tid"], item["oid"])
+        pairs.append((item["tid"], item["oid"]))
+    return list(dict.fromkeys(pairs))
 
 
 class RPC:  # pylint: disable=R0903,E1101
@@ -91,8 +123,10 @@ class RPC:  # pylint: disable=R0903,E1101
             values["last_login"] = last_login
         if suspended is not None:
             values["suspended"] = suspended
-        with self.db.engine.connect() as connection:
-            return connection.execute(
+        #
+        epoch = None
+        with revocation.transaction(self.db) as connection:
+            result = connection.execute(
                 self.db.tbl.user.update().where(
                     self.db.tbl.user.c.id == id_
                 ).values(**values
@@ -101,16 +135,32 @@ class RPC:  # pylint: disable=R0903,E1101
                     self.db.tbl.user.c.name
                 )
             ).first()
+            # A suspension change must reach every cache; it is bumped in the same
+            # transaction so nobody sees the new state under the old epoch.
+            if suspended is not None and result is not None:
+                epoch = revocation.bump_epoch(connection, self.db, "user", id_)
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", id_, epoch)
+        #
+        return result
 
     @web.rpc("auth_delete_user", "delete_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def delete_user(self, user_id: int):
         with self.db.engine.connect() as connection:
-            return connection.execute(
+            deleted = connection.execute(
                 self.db.tbl.user.delete().where(
                     self.db.tbl.user.c.id == user_id
                 )
             ).rowcount
+        # The row (and its tokens, by cascade) is gone, so there is no epoch left
+        # to bump: absence reads back as "no such user" and denies. The event only
+        # makes caches drop the user now.
+        if deleted:
+            revocation.fire_invalidate(self.context, "user", user_id, None)
+        #
+        return deleted
 
     @web.rpc("auth_get_user", "get_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
@@ -152,6 +202,107 @@ class RPC:  # pylint: disable=R0903,E1101
             raise RuntimeError("No such user found") from None
         #
         raise ValueError("ID or name is not provided")
+
+    @web.rpc("auth_get_user_by_idp_subject", "get_user_by_idp_subject")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def get_user_by_idp_subject(self, issuer: str, tid: str, oid: str) -> Optional[dict]:
+        """ The user that carries this IdP subject, None if nobody does """
+        _check_idp_subject(issuer, tid, oid)
+        #
+        tbl = self.db.tbl.user
+        with self.db.engine.connect() as connection:
+            user = connection.execute(
+                tbl.select().where(
+                    tbl.c.idp_issuer == issuer,
+                    tbl.c.idp_tid == tid,
+                    tbl.c.idp_oid == oid,
+                )
+            ).mappings().first()
+        #
+        return None if user is None else db_tools.sqlalchemy_mapping_to_dict(user)
+
+    @web.rpc("auth_get_users_by_idp_subjects", "get_users_by_idp_subjects")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def get_users_by_idp_subjects(self, issuer: str, subjects: list) -> dict:
+        """ Users carrying the given IdP subjects of one issuer, in one query
+
+        ``subjects`` is a list of ``{"tid": ..., "oid": ...}``, at most
+        ``MAX_IDP_SUBJECTS_PER_CALL`` (more is refused). Returns
+        ``{f"{tid}:{oid}": user}`` where ``user`` is exactly what
+        ``get_user_by_idp_subject`` returns; a subject nobody carries is absent.
+        The same lookup as the single RPC, batched: it reveals nothing more. A bad
+        issuer, a malformed subject or more than ``MAX_IDP_SUBJECTS_PER_CALL``
+        subjects is refused before any query, surfacing as the same ``RuntimeError``
+        wrapping as the single RPC's validation errors.
+        """
+        pairs = _check_idp_subjects(issuer, subjects)
+        if not pairs:
+            return {}
+        #
+        tbl = self.db.tbl.user
+        with self.db.engine.connect() as connection:
+            rows = connection.execute(
+                tbl.select().where(
+                    tbl.c.idp_issuer == issuer,
+                    sqlalchemy.tuple_(tbl.c.idp_tid, tbl.c.idp_oid).in_(pairs),
+                )
+            ).mappings().all()
+        #
+        return {
+            f"{row['idp_tid']}:{row['idp_oid']}": db_tools.sqlalchemy_mapping_to_dict(row)
+            for row in rows
+        }
+
+    @web.rpc("auth_set_user_idp_subject", "set_user_idp_subject")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def set_user_idp_subject(self, user_id: int, issuer: str, tid: str, oid: str) -> bool:
+        """ Link a user to an IdP subject, once
+
+        True if the subject was written, False if the user already carried exactly
+        this subject. Raises if the user carries a different one (a subject is
+        immutable: re-pointing an account is a decision for an operator, not for a
+        sign-in), if the user does not exist, or if another user already carries it.
+
+        The write is conditional on the user having no subject, so two concurrent
+        sign-ins cannot both link. It bumps the user's revocation epoch: cached
+        entries built before the link are dropped.
+        """
+        _check_idp_subject(issuer, tid, oid)
+        #
+        tbl = self.db.tbl.user
+        no_subject = sqlalchemy.and_(
+            tbl.c.idp_issuer.is_(None),
+            tbl.c.idp_tid.is_(None),
+            tbl.c.idp_oid.is_(None),
+        )
+        #
+        epoch = None
+        with revocation.transaction(self.db) as connection:
+            linked = connection.execute(
+                tbl.update().where(
+                    tbl.c.id == user_id, no_subject,
+                ).values(idp_issuer=issuer, idp_tid=tid, idp_oid=oid)
+            ).rowcount
+            #
+            if linked:
+                epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+            else:
+                current = connection.execute(
+                    sqlalchemy.select(
+                        tbl.c.idp_issuer, tbl.c.idp_tid, tbl.c.idp_oid,
+                    ).where(tbl.c.id == user_id)
+                ).first()
+                if current is None:
+                    raise ValueError(f"No such user found: id={user_id}")
+                if tuple(current) != (issuer, tid, oid):
+                    raise ValueError(
+                        f"User {user_id} is already linked to a different IdP subject"
+                    )
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        #
+        return bool(linked)
 
     @web.rpc("auth_list_users", "list_users")
     @rpc_tools.wrap_exceptions(RuntimeError)

@@ -22,7 +22,7 @@ from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
 import sqlalchemy
 
-from ..tools import rpc_tools
+from ..tools import rpc_tools, revocation
 from ..db import db_tools
 
 
@@ -185,43 +185,61 @@ class RPC:  # pylint: disable=R0903,E1101
             "role_id": role_id,
         }
         #
-        with self.db.engine.connect() as connection:
-            return connection.execute(
+        with revocation.transaction(self.db) as connection:
+            result = connection.execute(
                 self.db.tbl.project_user_role.insert().values(**values)
             ).inserted_primary_key[0]
+            # Project-role changes bump the user's epoch (see migration 202610151200)
+            epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        #
+        return result
 
     @web.rpc("auth_delete_project_user_role", "delete_project_user_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def delete_project_user_role(self, project_id, user_id, role_id):
-        with self.db.engine.connect() as connection:
-            return connection.execute(
+        with revocation.transaction(self.db) as connection:
+            deleted = connection.execute(
                 self.db.tbl.project_user_role.delete().where(
                     self.db.tbl.project_user_role.c.project_id == project_id,
                     self.db.tbl.project_user_role.c.user_id == user_id,
                     self.db.tbl.project_user_role.c.role_id == role_id,
                 )
             ).rowcount
+            epoch = revocation.bump_epoch(connection, self.db, "user", user_id) \
+                if deleted else None
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        #
+        return deleted
 
     @web.rpc("auth_update_project_user_roles", "update_project_user_roles")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def update_project_user_roles(self, project_id, user_id, role_ids):
         # Remove all roles and add new ones
-        with self.db.engine.connect() as connection:
-            with connection.begin():
+        with revocation.transaction(self.db) as connection:
+            connection.execute(
+                self.db.tbl.project_user_role.delete().where(
+                    self.db.tbl.project_user_role.c.project_id == project_id,
+                    self.db.tbl.project_user_role.c.user_id == user_id,
+                )
+            )
+            for role_id in role_ids:
                 connection.execute(
-                    self.db.tbl.project_user_role.delete().where(
-                        self.db.tbl.project_user_role.c.project_id == project_id,
-                        self.db.tbl.project_user_role.c.user_id == user_id,
+                    self.db.tbl.project_user_role.insert().values(
+                        project_id=project_id,
+                        user_id=user_id,
+                        role_id=role_id
                     )
                 )
-                for role_id in role_ids:
-                    connection.execute(
-                        self.db.tbl.project_user_role.insert().values(
-                            project_id=project_id,
-                            user_id=user_id,
-                            role_id=role_id
-                        )
-                    )
+            epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+        #
+        if epoch is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        #
         return True
 
     @web.rpc("auth_list_project_user_roles", "list_project_user_roles")
@@ -473,8 +491,21 @@ class RPC:  # pylint: disable=R0903,E1101
                 if a["user_id"] in valid_users
             ]
 
+            bumped = {}
             if assignments_to_insert:
                 connection.execute(
                     self.db.tbl.project_user_role.insert(), assignments_to_insert
                 )
+                # Same connection, straight after the insert. Only additions are
+                # applied here, but a new assignment still changes what the
+                # user's cached permissions must say.
+                for u_id in sorted({a["user_id"] for a in assignments_to_insert}):
+                    bumped[u_id] = revocation.bump_epoch(
+                        connection, self.db, "user", u_id,
+                    )
+        #
+        for u_id, epoch in bumped.items():
+            if epoch is not None:
+                revocation.fire_invalidate(self.context, "user", u_id, epoch)
+        #
         return True
