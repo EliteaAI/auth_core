@@ -18,8 +18,11 @@
 
 Projects with override rows never fall back to the role template, so without this
 grant nobody in an existing project could use Schedules (issue #7011).
-Roles that may create or edit agents get the six user permissions, custom roles
-included. Only roles named admin get admin, export and import (Change owner).
+Roles that may create or edit agents get list, details, create, update and delete.
+Run goes only to roles that already hold the agent predict permission. Admin,
+export and import go only to project roles named admin. A project role has no mode,
+so the grant never reads the system role table. Custom roles never gain run
+(without predict), admin, export or import here.
 
 The ids of the rows inserted here are kept in a ledger table so downgrade removes
 exactly those rows and keeps grants a project admin made later.
@@ -39,8 +42,9 @@ SCHEDULE_USER_PERMISSIONS = [
     "models.applications.schedules.create",
     "models.applications.schedules.update",
     "models.applications.schedules.delete",
-    "models.applications.schedules.run",
 ]
+
+SCHEDULE_RUN_PERMISSIONS = ["models.applications.schedules.run"]
 
 SCHEDULE_ADMIN_PERMISSIONS = [
     "models.applications.schedules.admin",
@@ -52,6 +56,8 @@ AGENT_EDIT_PERMISSIONS = [
     "models.applications.applications.create",
     "models.applications.application.update",
 ]
+
+PREDICT_PERMISSION = "models.applications.predict.post"
 
 LEDGER_SUFFIX = "__mig_202610191200_granted"
 
@@ -73,7 +79,10 @@ def _grant(bind, module_name, source, permissions, **params):
         )
         RETURNING id
         """
-    ).bindparams(*[sa.bindparam(name, expanding=True) for name in params])
+    ).bindparams(*[
+        sa.bindparam(name, expanding=isinstance(value, list))
+        for name, value in params.items()
+    ])
     inserted_ids = []
     for permission in permissions:
         inserted_ids += bind.execute(
@@ -102,6 +111,16 @@ def upgrade(module, payload):
         """,
         SCHEDULE_USER_PERMISSIONS,
         agent_permissions=AGENT_EDIT_PERMISSIONS,
+    )
+    inserted_ids += _grant(
+        bind, module_name,
+        f"""
+        SELECT DISTINCT project_id, role_id
+        FROM {module_name}__project_role_permission
+        WHERE permission = :predict_permission
+        """,
+        SCHEDULE_RUN_PERMISSIONS,
+        predict_permission=PREDICT_PERMISSION,
     )
     inserted_ids += _grant(
         bind, module_name,
@@ -141,7 +160,11 @@ def downgrade(module, payload):
             """
         ).bindparams(sa.bindparam(
             "perms",
-            value=SCHEDULE_USER_PERMISSIONS + SCHEDULE_ADMIN_PERMISSIONS,
+            value=(
+                SCHEDULE_USER_PERMISSIONS
+                + SCHEDULE_RUN_PERMISSIONS
+                + SCHEDULE_ADMIN_PERMISSIONS
+            ),
             expanding=True,
         ))
     )

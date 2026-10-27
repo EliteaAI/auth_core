@@ -1,8 +1,9 @@
-"""Coverage for alembic revision 202610191200 (EL-7011, US-46).
+"""Coverage for alembic revision 202610191200.
 
-Upgrade grants the schedule permission family to override roles: six user
-permissions to roles that may create or edit agents, three admin permissions to
-roles named admin. Downgrade removes only the rows the ledger lists.
+Upgrade grants the schedule permission family to override roles: five user
+permissions to roles that may create or edit agents, run to roles that hold the
+predict permission, three admin permissions to project roles named admin.
+Downgrade removes only the rows the ledger lists.
 PostgreSQL parity (TC-US46-16) and the single head check (TC-US46-17, -18)
 are outside this file.
 """
@@ -19,8 +20,10 @@ alembic_operations = pytest.importorskip("alembic.operations")
 
 PREFIX = "models.applications.schedules."
 USER_PERMISSIONS = {PREFIX + name for name in (
-    "list", "details", "create", "update", "delete", "run",
+    "list", "details", "create", "update", "delete",
 )}
+RUN_PERMISSION = PREFIX + "run"
+PREDICT = "models.applications.predict.post"
 ADMIN_PERMISSIONS = {PREFIX + name for name in ("admin", "export", "import")}
 AGENT_CREATE = "models.applications.applications.create"
 AGENT_UPDATE = "models.applications.application.update"
@@ -62,6 +65,12 @@ def module():
 @pytest.fixture
 def tables(engine):
     metadata = sa.MetaData()
+    system_role = sa.Table(
+        f"{TABLE_PREFIX}__role", metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("name", sa.Text, nullable=False),
+        sa.Column("mode", sa.Text, nullable=False),
+    )
     role = sa.Table(
         f"{TABLE_PREFIX}__project_role", metadata,
         sa.Column("id", sa.Integer, primary_key=True),
@@ -77,6 +86,12 @@ def tables(engine):
         sqlite_autoincrement=True,
     )
     metadata.create_all(engine)
+    with engine.connect() as connection:
+        connection.execute(system_role.insert(), [
+            {"name": name, "mode": mode}
+            for name in ("admin", "super_admin", "editor", "viewer", "system")
+            for mode in ("administration", "default", "developer")
+        ])
     return types.SimpleNamespace(role=role, permission=permission)
 
 
@@ -180,7 +195,7 @@ def test_el_7011_r1_2_existing_rows_are_skipped(db, upgrade):
 
     upgrade()
 
-    assert db.perms(1, "editor") == sorted(USER_PERMISSIONS)
+    assert db.perms(1, "editor") == sorted(USER_PERMISSIONS | {RUN_PERMISSION})
     assert db.count() - before == 4
 
 
@@ -204,6 +219,32 @@ def test_el_7011_r2_1_admin_role_gets_admin_permissions(db, upgrade):
     assert db.perms(1, "admin") == sorted(USER_PERMISSIONS | ADMIN_PERMISSIONS)
 
 
+def test_run_goes_only_to_roles_holding_predict(db, upgrade):
+    db.grant(1, "editor", AGENT_CREATE, PREDICT)
+    db.grant(1, "team-lead", AGENT_UPDATE)
+
+    upgrade()
+
+    assert RUN_PERMISSION in db.perms(1, "editor")
+    assert RUN_PERMISSION not in db.perms(1, "team-lead")
+
+
+def test_predict_holder_without_agent_edit_gets_run_only(db, upgrade):
+    db.grant(1, "runner", PREDICT)
+
+    upgrade()
+
+    assert db.perms(1, "runner") == [RUN_PERMISSION]
+
+
+def test_custom_role_gets_no_admin_permissions(db, upgrade):
+    db.grant(1, "team-lead", AGENT_CREATE, AGENT_UPDATE, PREDICT)
+
+    upgrade()
+
+    assert not set(db.perms(1, "team-lead")) & ADMIN_PERMISSIONS
+
+
 def test_el_7011_r2_2_editor_gets_no_admin_permissions(db, upgrade):
     db.grant(1, "editor", AGENT_CREATE, AGENT_UPDATE)
 
@@ -212,15 +253,22 @@ def test_el_7011_r2_2_editor_gets_no_admin_permissions(db, upgrade):
     assert not set(db.perms(1, "editor")) & ADMIN_PERMISSIONS
 
 
-@pytest.mark.parametrize("role_name", ["super_admin", "system"])
-def test_el_7011_r2_2_other_admin_like_roles_get_user_permissions_only(
-        db, upgrade, role_name,
-):
-    db.grant(1, role_name, AGENT_CREATE)
+def test_viewer_gets_no_admin_permissions(db, upgrade):
+    db.grant(1, "viewer", AGENT_CREATE)
 
     upgrade()
 
-    assert db.perms(1, role_name) == sorted(USER_PERMISSIONS)
+    assert not set(db.perms(1, "viewer")) & ADMIN_PERMISSIONS
+
+
+def test_system_role_names_other_than_admin_get_user_permissions_only(db, upgrade):
+    db.grant(1, "system", AGENT_CREATE)
+    db.grant(1, "super_admin", AGENT_CREATE)
+
+    upgrade()
+
+    assert db.perms(1, "system") == sorted(USER_PERMISSIONS)
+    assert db.perms(1, "super_admin") == sorted(USER_PERMISSIONS)
 
 
 # AC3: R1.3, R1.4
@@ -271,7 +319,7 @@ def test_el_7011_r3_1_ledger_lists_every_inserted_row(db, engine, upgrade):
 
     upgrade()
 
-    assert len(ledger_ids(engine)) == db.count() - seeded == 9
+    assert len(ledger_ids(engine)) == db.count() - seeded == 8
 
 
 def test_el_7011_r3_2_downgrade_removes_ledger_rows_and_drops_ledger(
@@ -348,4 +396,4 @@ def test_el_7011_r1_2_upgrade_downgrade_upgrade_adds_no_duplicate(
     upgrade()
 
     assert db.duplicates() == []
-    assert db.perms(1, "editor") == sorted(USER_PERMISSIONS)
+    assert db.perms(1, "editor") == sorted(USER_PERMISSIONS | {RUN_PERMISSION})
