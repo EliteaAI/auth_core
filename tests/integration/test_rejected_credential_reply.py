@@ -109,6 +109,7 @@ def test_a_rejected_credential_is_a_401_not_a_redirect(modules, monkeypatch, hea
 
     assert isinstance(reply, Response)
     assert reply.status_code == 401
+    assert reply.data == {"ok": False, "error": "unauthorized"}
     assert reply.headers["WWW-Authenticate"] == "Bearer"
 
 
@@ -140,7 +141,7 @@ def test_the_rpc_reply_for_a_rejected_credential_is_a_401_response_not_a_redirec
         "auth_ok": False,
         "reply": "access_denied",
         "action": "make_response",
-        "data": "Unauthorized",
+        "data": {"ok": False, "error": "unauthorized"},
         "status_code": 401,
     }
 

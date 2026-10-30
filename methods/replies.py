@@ -75,10 +75,10 @@ class Method:  # pylint: disable=E1101,R0903
                 "auth_ok": False,
                 "reply": "access_denied",
                 "action": "make_response",
-                "data": "Unauthorized",
+                "data": {"ok": False, "error": "unauthorized"},
                 "status_code": 401,
             }
-        response = flask.make_response("Unauthorized", 401)
+        response = flask.make_response({"ok": False, "error": "unauthorized"}, 401)
         response.headers["WWW-Authenticate"] = "Bearer"
         return response
 
