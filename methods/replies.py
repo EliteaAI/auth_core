@@ -64,6 +64,25 @@ class Method:  # pylint: disable=E1101,R0903
         return flask.make_response("Access Denied", 403)
 
     @web.method()
+    def credential_rejected_reply(self, source, to_json=False):
+        """ Traefik/client: bad credential reply, never a redirect: clients resend the credential and loop """
+        for rule in self.public_rules:
+            if self.public_rule_matches(rule, source):
+                return self.access_success_reply(source, "public", to_json=to_json)
+        #
+        if to_json:
+            return {
+                "auth_ok": False,
+                "reply": "access_denied",
+                "action": "make_response",
+                "data": {"ok": False, "error": "unauthorized"},
+                "status_code": 401,
+            }
+        response = flask.make_response({"ok": False, "error": "unauthorized"}, 401)
+        response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+
+    @web.method()
     def access_success_reply(  # pylint: disable=R0913,R0917
             self, source,
             auth_type, auth_id="-", auth_reference="-",

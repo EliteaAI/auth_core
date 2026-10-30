@@ -59,14 +59,14 @@ class Route:  # pylint: disable=E1101,R0903
             auth_header = flask.request.headers.get("Authorization")
             if " " not in auth_header:
                 # Invalid auth header
-                return self.access_denied_reply(source)
+                return self.credential_rejected_reply(source)
             #
             credential_type, credential_data = auth_header.split(" ", 1)
             credential_type = credential_type.lower()
             #
             if credential_type not in self.credential_handlers:
                 # No credential handler
-                return self.access_denied_reply(source)
+                return self.credential_rejected_reply(source)
             #
             try:
                 auth_type, auth_id, auth_reference = \
@@ -75,7 +75,7 @@ class Route:  # pylint: disable=E1101,R0903
                     )
             except:  # pylint: disable=W0702
                 # Bad credential
-                return self.access_denied_reply(source)
+                return self.credential_rejected_reply(source)
             #
             return self.access_success_reply(
                 source, auth_type, auth_id, auth_reference
@@ -88,7 +88,7 @@ class Route:  # pylint: disable=E1101,R0903
                 #
                 if credential_type not in self.credential_handlers:
                     # No credential handler
-                    return self.access_denied_reply(source)
+                    return self.credential_rejected_reply(source)
                 #
                 try:
                     auth_type, auth_id, auth_reference = \
@@ -97,7 +97,7 @@ class Route:  # pylint: disable=E1101,R0903
                         )
                 except:  # pylint: disable=W0702
                     # Bad credential
-                    return self.access_denied_reply(source)
+                    return self.credential_rejected_reply(source)
                 #
                 return self.access_success_reply(
                     source, auth_type, auth_id, auth_reference
