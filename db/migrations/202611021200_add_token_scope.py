@@ -29,6 +29,11 @@ refuses a scope without an expiry); every token that exists before the upgrade h
 neither and stays what it is (a legacy token). The statements are guarded so that
 re-running them, or running them against a database that already has the columns,
 is a no-op.
+
+Downgrade: dropping the columns turns every scoped token into an unscoped one that
+still expires (it then acts in all its owner's projects, with all their rights, until
+it expires). The downgrade logs how many scoped tokens it unscopes; delete them first
+(or let them expire) when that is not wanted.
 """
 
 revision = "202611021200"
@@ -37,6 +42,7 @@ branch_labels = None
 
 from alembic import op  # pylint: disable=E0401,C0413
 import sqlalchemy as sa  # pylint: disable=E0401,C0413
+from pylon.core.tools import log  # pylint: disable=E0401,C0413
 
 
 COLUMNS = ("scope_projects", "scope_operations")
@@ -60,6 +66,12 @@ def downgrade(module, payload):
     _ = payload
     table = f"{module.descriptor.name}__token"
     existing = _columns(table)
+    if "scope_projects" in existing:
+        scoped = op.get_bind().execute(sa.text(
+            f'SELECT count(*) FROM "{table}" WHERE scope_projects IS NOT NULL'
+        )).scalar()
+        if scoped:
+            log.warning("Downgrade unscopes %s scoped API token(s): they keep their expiry", scoped)
     for name in COLUMNS:
         if name in existing:
             op.drop_column(table, name)

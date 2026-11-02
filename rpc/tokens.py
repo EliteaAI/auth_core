@@ -52,6 +52,12 @@ SCOPED_TOKEN_MAX_PROJECTS = 100
 _EXPIRY_SLACK = datetime.timedelta(minutes=5)
 
 
+def _within_scoped_ttl(expires) -> bool:
+    """ Is this an expiry a scoped token may have (set, at most the cap ahead)? A past one retires it """
+    return isinstance(expires, datetime.datetime) and expires <= datetime.datetime.now() + \
+        datetime.timedelta(days=SCOPED_TOKEN_MAX_TTL_DAYS) + _EXPIRY_SLACK
+
+
 def _scope_values(user_projects, expires, projects, operations) -> dict:
     """ The scope columns of a new token, validated; {} for an unscoped one
 
@@ -170,11 +176,20 @@ class RPC:  # pylint: disable=R0903,E1101
         together, so a cache entry built before the change can never be
         mistaken for current. System tokens are refused (the guard is in the
         WHERE clause, like delete_token): their invariant is "never expires".
+        A scoped token (#7336) keeps an expiry within SCOPED_TOKEN_MAX_TTL_DAYS: clearing or
+        extending it past the cap would silently make it a legacy token, so that is refused.
         Returns the new epoch, or None if no such (non-system) token.
         """
         tbl = self.db.tbl.token
         #
         with revocation.transaction(self.db) as connection:
+            scoped = connection.execute(
+                sa.select(tbl.c.scope_projects).where(tbl.c.id == token_id)
+            ).scalar() is not None
+            if scoped and not _within_scoped_ttl(expires):
+                raise ValueError(
+                    f"A scoped token expires within {SCOPED_TOKEN_MAX_TTL_DAYS} days"
+                )
             updated = connection.execute(
                 tbl.update().where(
                     tbl.c.id == token_id,

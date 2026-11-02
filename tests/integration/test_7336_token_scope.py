@@ -136,3 +136,20 @@ def test_the_system_token_is_untouched(scoped_rpc, tokens):
     assert (row["name"], row["expires"], row["scope_projects"], row["scope_operations"]) == (
         tokens.SYSTEM_TOKEN_NAME, None, None, None)
     assert scoped_rpc.list_tokens(user_id=7) == []   # still hidden from the user's list
+
+
+def test_a_scoped_tokens_expiry_cannot_be_cleared_or_pushed_past_the_cap(scoped_rpc):
+    token_id = scoped_rpc.add_token(user_id=7, name="ci", expires=soon(), scope_projects=[3], scope_operations=["run"])
+    for refused in (None, datetime.datetime.now() + datetime.timedelta(days=91)):
+        with pytest.raises(RuntimeError, match="expires within 90 days"):
+            scoped_rpc.set_token_expiry(token_id, refused)
+        assert row_of(scoped_rpc, token_id)["revocation_epoch"] == 0   # nothing changed, no epoch bump
+    shorter = datetime.datetime.now() + datetime.timedelta(days=1)
+    assert scoped_rpc.set_token_expiry(token_id, shorter) == 1          # shortening (rotation retiring it) stays
+    assert scoped_rpc.set_token_expiry(token_id, datetime.datetime.now() - datetime.timedelta(minutes=1)) == 2
+
+
+def test_a_legacy_tokens_expiry_is_set_as_before(scoped_rpc):
+    token_id = scoped_rpc.add_token(user_id=7, name="old")
+    assert scoped_rpc.set_token_expiry(token_id, datetime.datetime.now() + datetime.timedelta(days=400)) == 1
+    assert scoped_rpc.set_token_expiry(token_id, None) == 2

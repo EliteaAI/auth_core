@@ -82,3 +82,15 @@ def test_upgrade_and_downgrade_are_idempotent(revision, engine, pre_migration_to
     assert "scope_projects" not in columns and "scope_operations" not in columns
     with engine.connect() as connection:
         assert connection.execute(sa.text(f"SELECT name FROM {TABLE_PREFIX}__token WHERE id = 1")).scalar() == "api"
+
+
+def test_the_downgrade_says_how_many_scoped_tokens_it_unscopes(revision, engine, pre_migration_token, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(revision, "log", types.SimpleNamespace(warning=lambda msg, *a: warnings.append(msg % a)))
+    run_migration(revision, engine, "upgrade")
+    with engine.connect() as connection:
+        connection.execute(sa.text(
+            f"INSERT INTO {TABLE_PREFIX}__token (id, uuid, user_id, name, scope_projects, scope_operations) "
+            "VALUES (2, 'v', 7, 'ci', '[2]', '[\"run\"]')"))
+    run_migration(revision, engine, "downgrade")
+    assert warnings == ["Downgrade unscopes 1 scoped API token(s): they keep their expiry"]
