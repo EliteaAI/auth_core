@@ -42,6 +42,57 @@ SYSTEM_TOKEN_NAME = "elitea-system"
 # namespace while leaving it a listable, deletable token of its owner.
 EVICTED_NAME_PREFIX = f"{SYSTEM_TOKEN_NAME}-conflict-"
 
+# A scoped token (C-1009, #7336) names the projects it may act in and the operations
+# it may do there, and it expires within this many days. It is scoped only when both
+# lists are set and it expires; add_token() refuses anything in between.
+SCOPED_TOKEN_MAX_TTL_DAYS = 90
+TOKEN_OPERATIONS = ("run", "build", "admin")
+SCOPED_TOKEN_MAX_PROJECTS = 100
+# Slack for the clock of the caller that computed the expiry (the REST layer)
+_EXPIRY_SLACK = datetime.timedelta(minutes=5)
+
+
+def _within_scoped_ttl(expires) -> bool:
+    """ Is this an expiry a scoped token may have (set, at most the cap ahead)? A past one retires it """
+    return isinstance(expires, datetime.datetime) and expires <= datetime.datetime.now() + \
+        datetime.timedelta(days=SCOPED_TOKEN_MAX_TTL_DAYS) + _EXPIRY_SLACK
+
+
+def _scope_values(user_projects, expires, projects, operations) -> dict:
+    """ The scope columns of a new token, validated; {} for an unscoped one
+
+    ``user_projects(ids)`` returns which of ``ids`` the owner is a member of. One
+    error for any project the owner is not a member of, whether it exists or not.
+    """
+    if projects is None and operations is None:
+        return {}
+    if projects is None or operations is None:
+        raise ValueError("A token scope needs both projects and operations")
+    if not isinstance(projects, (list, tuple)) or not projects \
+            or len(projects) > SCOPED_TOKEN_MAX_PROJECTS \
+            or not all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in projects):
+        raise ValueError(
+            f"A token scope needs 1 to {SCOPED_TOKEN_MAX_PROJECTS} project ids"
+        )
+    if not isinstance(operations, (list, tuple)) or not operations \
+            or not all(item in TOKEN_OPERATIONS for item in operations):
+        raise ValueError(f"A token scope needs operations among {TOKEN_OPERATIONS}")
+    if not isinstance(expires, datetime.datetime):
+        raise ValueError("A scoped token needs an expiry")
+    now = datetime.datetime.now()
+    if expires <= now or \
+            expires > now + datetime.timedelta(days=SCOPED_TOKEN_MAX_TTL_DAYS) + _EXPIRY_SLACK:
+        raise ValueError(
+            f"A scoped token expires within {SCOPED_TOKEN_MAX_TTL_DAYS} days"
+        )
+    projects = sorted(set(projects))
+    if set(user_projects(projects)) != set(projects):
+        raise ValueError("A token can be scoped only to projects its owner is a member of")
+    return {
+        "scope_projects": projects,
+        "scope_operations": [item for item in TOKEN_OPERATIONS if item in operations],
+    }
+
 
 class RPC:  # pylint: disable=R0903,E1101
 
@@ -51,13 +102,21 @@ class RPC:  # pylint: disable=R0903,E1101
                    user_id: int,
                    name: str = "",
                    expires: Optional[datetime.datetime] = None,
-                   token_id: Optional[int] = None):
+                   token_id: Optional[int] = None,
+                   scope_projects: Optional[list] = None,
+                   scope_operations: Optional[list] = None):
         if name == SYSTEM_TOKEN_NAME:
             # System tokens are inserted by ensure_system_token() and add_user()
             # directly. Refusing the name here means no other caller - including
             # one that bypasses the HTTP layer - can mint a row that resolution
             # would later mistake for the platform's own token.
             raise ValueError(f"Token name is reserved: {name}")
+        # A scope (#7336) is checked here, whoever calls: the projects are the
+        # owner's, the operations known, the expiry set and bounded
+        scope = _scope_values(
+            lambda ids: self.check_user_in_projects(ids, user_id),
+            expires, scope_projects, scope_operations,
+        )
         #
         token_uuid = str(uuid_.uuid4())
         #
@@ -66,6 +125,7 @@ class RPC:  # pylint: disable=R0903,E1101
             "user_id": user_id,
             "expires": expires,
             "name": name,
+            **scope,
         }
 
         if token_id:
@@ -116,11 +176,20 @@ class RPC:  # pylint: disable=R0903,E1101
         together, so a cache entry built before the change can never be
         mistaken for current. System tokens are refused (the guard is in the
         WHERE clause, like delete_token): their invariant is "never expires".
+        A scoped token (#7336) keeps an expiry within SCOPED_TOKEN_MAX_TTL_DAYS: clearing or
+        extending it past the cap would silently make it a legacy token, so that is refused.
         Returns the new epoch, or None if no such (non-system) token.
         """
         tbl = self.db.tbl.token
         #
         with revocation.transaction(self.db) as connection:
+            scoped = connection.execute(
+                sa.select(tbl.c.scope_projects).where(tbl.c.id == token_id)
+            ).scalar() is not None
+            if scoped and not _within_scoped_ttl(expires):
+                raise ValueError(
+                    f"A scoped token expires within {SCOPED_TOKEN_MAX_TTL_DAYS} days"
+                )
             updated = connection.execute(
                 tbl.update().where(
                     tbl.c.id == token_id,
