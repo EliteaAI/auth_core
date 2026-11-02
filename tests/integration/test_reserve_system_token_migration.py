@@ -215,6 +215,8 @@ def test_upgrade_on_a_clean_table_is_a_no_op_apart_from_the_index(
         "user_id": 1,
         "name": "mine",
         "revocation_epoch": 0,
+        "scope_projects": None,
+        "scope_operations": None,
     }
 
 

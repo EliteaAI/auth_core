@@ -93,6 +93,9 @@ def define_tables(metadata: sa.MetaData) -> tuple:
             "revocation_epoch", sa.BigInteger, nullable=False,
             server_default=sa.text("0"),
         ),
+        # From migration 202611021200 (C-1009, #7336).
+        sa.Column("scope_projects", sa.JSON, nullable=True),
+        sa.Column("scope_operations", sa.JSON, nullable=True),
     )
     user = sa.Table(
         f"{TABLE_PREFIX}__user", metadata,
