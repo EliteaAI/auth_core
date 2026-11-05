@@ -43,3 +43,12 @@ def test_7436_other_users_projects_are_not_included(subject):
 
 def test_7436_user_without_projects_gets_an_empty_list(subject):
     assert subject.list_user_project_ids(99) == []
+
+
+# list_user_projects used to ask check_user_in_projects about every platform project; the new RPC must
+# return exactly that membership, so any extra condition added to either query later shows up here
+@pytest.mark.parametrize("user_id", [7, 8, 99])
+def test_7436_matches_check_user_in_projects_over_all_projects(subject, user_id):
+    all_project_ids = [3, 4, 5, 9, 11]
+    expected = subject.check_user_in_projects(all_project_ids, user_id)
+    assert sorted(subject.list_user_project_ids(user_id)) == sorted(expected)
