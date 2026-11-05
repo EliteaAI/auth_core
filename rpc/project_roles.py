@@ -343,6 +343,20 @@ class RPC:  # pylint: disable=R0903,E1101
         #
         return [row[0] for row in results]
 
+    @web.rpc("auth_list_user_project_ids", "list_user_project_ids")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def list_user_project_ids(self, user_id):
+        query = sqlalchemy.select(
+            self.db.tbl.project_user_role.c.project_id
+        ).where(
+            self.db.tbl.project_user_role.c.user_id == user_id,
+        ).distinct()
+        #
+        with self.db.engine.connect() as connection:
+            results = connection.execute(query).all()
+        #
+        return [row[0] for row in results]
+
     @web.rpc("auth_list_project_users", "list_project_users")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def list_project_users(self, project_id):
