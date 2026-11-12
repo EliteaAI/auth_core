@@ -145,6 +145,21 @@ class RPC:  # pylint: disable=R0903,E1101
         #
         return result
 
+    @web.rpc("auth_record_first_login", "record_first_login")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def record_first_login(self, user_id: int, when: datetime.datetime) -> bool:
+        """ Set first_login once, only for a user who has never logged in """
+        tbl = self.db.tbl.user
+        with self.db.engine.connect() as connection:
+            updated = connection.execute(
+                tbl.update().where(
+                    tbl.c.id == user_id,
+                    tbl.c.first_login.is_(None),
+                    tbl.c.last_login.is_(None),
+                ).values(first_login=when)
+            ).rowcount
+        return bool(updated)
+
     @web.rpc("auth_delete_user", "delete_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
     def delete_user(self, user_id: int):
