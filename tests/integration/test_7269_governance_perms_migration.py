@@ -41,7 +41,7 @@ def governance(db, project_id, role):
 
 def test_the_revision_is_the_one_head_on_top_of_the_token_scope(revision, plugin_root):
     assert (revision.revision, revision.down_revision) == ("202611031200", "202611021200")
-    assert find_heads(read_links(plugin_root / "db" / "migrations")) == ["202611031200"]
+    assert len(find_heads(read_links(plugin_root / "db" / "migrations"))) == 1
 
 
 def test_admins_get_the_operator_and_request_permissions_editors_the_request_only(db, upgrade):

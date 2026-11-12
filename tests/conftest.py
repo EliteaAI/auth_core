@@ -115,6 +115,9 @@ def define_tables(metadata: sa.MetaData) -> tuple:
         sa.Column("idp_issuer", sa.Text, nullable=True),
         sa.Column("idp_tid", sa.Text, nullable=True),
         sa.Column("idp_oid", sa.Text, nullable=True),
+        sa.Column("last_login", sa.DateTime, nullable=True),
+        # From migration 202611121200 (#7490).
+        sa.Column("first_login", sa.DateTime, nullable=True),
     )
     return token, user
 

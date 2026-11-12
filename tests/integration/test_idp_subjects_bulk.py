@@ -72,6 +72,7 @@ def test_a_user_has_exactly_the_public_keys_and_no_credential_material(rpc):
 
     assert set(user) == {
         "id", "email", "name", "suspended", "revocation_epoch", "idp_issuer", "idp_tid", "idp_oid",
+        "last_login", "first_login",
     }
 
 
