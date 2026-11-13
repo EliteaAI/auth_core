@@ -31,6 +31,8 @@ revision = "202611131200"
 down_revision = "202611121200"
 branch_labels = None
 
+import os  # pylint: disable=C0413
+
 import sqlalchemy as sa  # pylint: disable=E0401,C0413
 from alembic import op  # pylint: disable=E0401,C0413
 from pylon.core.tools import log  # pylint: disable=E0401,C0413
@@ -39,9 +41,19 @@ PERSONAL_PREFIX = "project_user_"
 LEDGER_SUFFIX = "__mig_202611131200_granted"
 
 
-def _private_projects(bind):
+def _project_table(bind):
+    """ The projects plugin keeps project in POSTGRES_SCHEMA, not in auth_core's search_path """
+    inspector = sa.inspect(bind)
+    if bind.dialect.name == "postgresql":
+        schema = os.environ.get("POSTGRES_SCHEMA", "centry")
+        if inspector.has_table("project", schema=schema):
+            return f'"{schema}".project'
+    return "project" if inspector.has_table("project") else None
+
+
+def _private_projects(bind, project_table):
     return bind.execute(sa.text(
-        "SELECT id, name, owner_id FROM project WHERE name LIKE :prefix ORDER BY id"
+        f"SELECT id, name, owner_id FROM {project_table} WHERE name LIKE :prefix ORDER BY id"
     ), {"prefix": f"{PERSONAL_PREFIX}%"}).all()
 
 
@@ -56,13 +68,14 @@ def upgrade(module, payload):
     if not sa.inspect(bind).has_table(ledger):
         op.create_table(ledger, sa.Column("id", sa.Integer, primary_key=True))
     #
-    if not sa.inspect(bind).has_table("project"):
+    project_table = _project_table(bind)
+    if project_table is None:
         log.warning("project table missing; no private project owner was granted admin")
         return
     #
     inserted_ids = []
     granted_users = []
-    for project_id, name, owner_id in _private_projects(bind):
+    for project_id, name, owner_id in _private_projects(bind, project_table):
         uid = name[len(PERSONAL_PREFIX):]
         is_member = uid.isdigit() and bind.execute(sa.text(
             f"SELECT 1 FROM {user_role} WHERE project_id = :project_id AND user_id = :user_id LIMIT 1"
