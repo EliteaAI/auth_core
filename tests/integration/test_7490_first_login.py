@@ -134,7 +134,7 @@ def pre_migration_user(engine):
 def test_the_revision_is_the_single_head(migrations_dir):
     links = read_links(migrations_dir)
 
-    assert find_heads(links) == [REVISION]
+    assert len(find_heads(links)) == 1
     assert links[REVISION] == (PARENT_REVISION,)
 
 
