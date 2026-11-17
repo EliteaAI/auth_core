@@ -28,6 +28,7 @@ from sqlalchemy.exc import NoResultFound
 from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 
 from ..tools import rpc_tools, revocation
+from ..tools import lifecycle_audit as audit
 from ..db import db_tools
 from .tokens import SYSTEM_TOKEN_NAME
 
@@ -64,11 +65,34 @@ def _check_idp_subjects(issuer, subjects):
     return list(dict.fromkeys(pairs))
 
 
+def _user_change_events(before, values, audit_ctx):
+    """ name / email / suspended events for the values that actually change """
+    if before is None:
+        return []
+    after = dict(before, **{key: values[key] for key in ("name", "email") if key in values})
+    events = []
+    for field, event_type in (("name", "user.name_changed"), ("email", "user.email_changed")):
+        if field in values and values[field] != before[field]:
+            events.append(audit.build(
+                event_type, audit_ctx, "platform", user=after,
+                changes={field: {"before": before[field], "after": values[field]}},
+            ))
+    if "suspended" in values and bool(values["suspended"]) != bool(before["suspended"]):
+        events.append(audit.build(
+            "user.suspended" if values["suspended"] else "user.unsuspended",
+            audit_ctx, "platform", user=after,
+            changes={"suspended": {"before": bool(before["suspended"]),
+                                   "after": bool(values["suspended"])}},
+        ))
+    return events
+
+
 class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_add_user", "add_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def add_user(self, email: str, name: Optional[str] = '', id_: Optional[int] = None):
+    def add_user(self, email: str, name: Optional[str] = '', id_: Optional[int] = None,
+                 audit_ctx: Optional[dict] = None):
         """ Create a user together with its system token, atomically """
         values = {
             "email": email,
@@ -78,41 +102,41 @@ class RPC:  # pylint: disable=R0903,E1101
         if id_:
             values["id"] = id_
 
-        # The engine is configured with isolation_level=AUTOCOMMIT, so the two
-        # inserts below would commit independently and a crash in between would
-        # leave a user with no system token. Request a real transaction for this
-        # connection only.
-        isolation_level = "SERIALIZABLE" \
-            if self.db.url.startswith("sqlite:") else "READ COMMITTED"
-
-        with self.db.engine.connect().execution_options(
-                isolation_level=isolation_level,
-        ) as connection:
-            with connection.begin():
-                user_id = connection.execute(
-                    self.db.tbl.user.insert().values(**values)
-                ).inserted_primary_key[0]
-                #
-                connection.execute(
-                    self.db.tbl.token.insert().values(
-                        uuid=str(uuid_.uuid4()),
-                        user_id=user_id,
-                        expires=None,
-                        name=SYSTEM_TOKEN_NAME,
-                    )
+        # The engine is configured with isolation_level=AUTOCOMMIT, so the inserts
+        # below would commit independently and a crash in between would leave a user
+        # with no system token (or no audit event). revocation.transaction() requests
+        # a real transaction for this connection only.
+        def _change(connection):
+            user_id = connection.execute(
+                self.db.tbl.user.insert().values(**values)
+            ).inserted_primary_key[0]
+            #
+            connection.execute(
+                self.db.tbl.token.insert().values(
+                    uuid=str(uuid_.uuid4()),
+                    user_id=user_id,
+                    expires=None,
+                    name=SYSTEM_TOKEN_NAME,
                 )
+            )
+            event = audit.build(
+                "user.created", audit_ctx, "platform",
+                user={"id": user_id, "name": values.get("name"), "email": email},
+            )
+            return user_id, [event]
         #
-        return user_id
+        return audit.transact(self.db, _change)
 
     @web.rpc("auth_update_user", "update_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def update_user(
+    def update_user(  # pylint: disable=R0913
             self,
             id_: int,
             name: Optional[str] = '',
             last_login: Optional[datetime.datetime] = None,
             suspended: Optional[bool] = None,
             email: Optional[str] = None,
+            audit_ctx: Optional[dict] = None,
     ):
         values = {}
         if name:
@@ -124,8 +148,10 @@ class RPC:  # pylint: disable=R0903,E1101
         if suspended is not None:
             values["suspended"] = suspended
         #
-        epoch = None
-        with revocation.transaction(self.db) as connection:
+        state = {"epoch": None}
+        #
+        def _change(connection):
+            before = audit.user_row(connection, self.db, id_, for_update=True)
             result = connection.execute(
                 self.db.tbl.user.update().where(
                     self.db.tbl.user.c.id == id_
@@ -138,19 +164,24 @@ class RPC:  # pylint: disable=R0903,E1101
             # A suspension change must reach every cache; it is bumped in the same
             # transaction so nobody sees the new state under the old epoch.
             if suspended is not None and result is not None:
-                epoch = revocation.bump_epoch(connection, self.db, "user", id_)
+                state["epoch"] = revocation.bump_epoch(connection, self.db, "user", id_)
+            return result, _user_change_events(before, values, audit_ctx)
         #
-        if epoch is not None:
-            revocation.fire_invalidate(self.context, "user", id_, epoch)
+        result = audit.transact(self.db, _change)
+        #
+        if state["epoch"] is not None:
+            revocation.fire_invalidate(self.context, "user", id_, state["epoch"])
         #
         return result
 
     @web.rpc("auth_record_first_login", "record_first_login")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def record_first_login(self, user_id: int, when: datetime.datetime) -> bool:
+    def record_first_login(self, user_id: int, when: datetime.datetime,
+                           audit_ctx: Optional[dict] = None) -> bool:
         """ Set first_login once, only for a user who has never logged in """
         tbl = self.db.tbl.user
-        with self.db.engine.connect() as connection:
+        #
+        def _change(connection):
             updated = connection.execute(
                 tbl.update().where(
                     tbl.c.id == user_id,
@@ -158,17 +189,46 @@ class RPC:  # pylint: disable=R0903,E1101
                     tbl.c.last_login.is_(None),
                 ).values(first_login=when)
             ).rowcount
-        return bool(updated)
+            if not updated:
+                return False, []
+            user = audit.user_row(connection, self.db, user_id)
+            return True, [audit.build(
+                "user.first_login", audit_ctx, "platform", user=user,
+                details={"first_login": when.isoformat()},
+            )]
+        #
+        return bool(audit.transact(self.db, _change))
 
     @web.rpc("auth_delete_user", "delete_user")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def delete_user(self, user_id: int):
-        with self.db.engine.connect() as connection:
+    def delete_user(self, user_id: int, audit_ctx: Optional[dict] = None):
+        def _change(connection):
+            # Snapshot first: the cascade below removes memberships and roles silently
+            user = audit.user_row(connection, self.db, user_id, for_update=True)
+            memberships = audit.user_memberships(connection, self.db, user_id) if user else {}
+            platform_roles = audit.platform_role_names(
+                connection, self.db, user_id, "administration",
+            ) if user else []
             deleted = connection.execute(
                 self.db.tbl.user.delete().where(
                     self.db.tbl.user.c.id == user_id
                 )
             ).rowcount
+            if not deleted:
+                return deleted, []
+            events = [audit.build(
+                "user.deleted", audit_ctx, "platform", user=user,
+                roles_before=platform_roles, roles_after=[],
+                details={"projects": sorted(memberships)},
+                admin_roles=audit.PLATFORM_ADMIN_ROLES,
+            )]
+            for project_id, roles in memberships.items():
+                events.append(audit.membership_event(
+                    audit_ctx, project_id, user, roles, [], details={"reason": "user_deleted"},
+                ))
+            return deleted, events
+        #
+        deleted = audit.transact(self.db, _change)
         # The row (and its tokens, by cascade) is gone, so there is no epoch left
         # to bump: absence reads back as "no such user" and denies. The event only
         # makes caches drop the user now.

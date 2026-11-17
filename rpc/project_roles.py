@@ -23,7 +23,15 @@ from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 import sqlalchemy
 
 from ..tools import rpc_tools, revocation
+from ..tools import lifecycle_audit as audit
 from ..db import db_tools
+
+
+def _membership(connection, db, audit_ctx, project_id, user_id, before, details=None):  # pylint: disable=R0913
+    """ The membership event for one user after a change on this connection """
+    after = audit.project_role_names(connection, db, project_id, user_id)
+    user = audit.user_row(connection, db, user_id) or {"id": user_id}
+    return audit.membership_event(audit_ctx, project_id, user, before, after, details=details)
 
 
 class RPC:  # pylint: disable=R0903,E1101
@@ -69,25 +77,38 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_delete_project_role", "delete_project_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def delete_project_role(self, project_id, name=..., id_=...):
-        with self.db.engine.connect() as connection:
-            if name is not ...:
-                return connection.execute(
-                    self.db.tbl.project_role.delete().where(
-                        self.db.tbl.project_role.c.project_id == project_id,
-                        self.db.tbl.project_role.c.name == name,
-                    )
-                ).rowcount
-            #
-            if id_ is not ...:
-                return connection.execute(
-                    self.db.tbl.project_role.delete().where(
-                        self.db.tbl.project_role.c.project_id == project_id,
-                        self.db.tbl.project_role.c.id == id_,
-                    )
-                ).rowcount
-            #
+    def delete_project_role(self, project_id, name=..., id_=..., audit_ctx=None):
+        tbl = self.db.tbl.project_role
+        if name is not ...:
+            where = (tbl.c.project_id == project_id, tbl.c.name == name)
+        elif id_ is not ...:
+            where = (tbl.c.project_id == project_id, tbl.c.id == id_)
+        else:
             return 0
+        #
+        def _change(connection):
+            role_ids = [row[0] for row in connection.execute(
+                tbl.select().with_only_columns(tbl.c.id).where(*where)
+            ).all()]
+            pur = self.db.tbl.project_user_role
+            holders = sorted({row[0] for row in connection.execute(
+                pur.select().with_only_columns(pur.c.user_id).where(
+                    pur.c.project_id == project_id, pur.c.role_id.in_(role_ids),
+                )
+            ).all()}) if role_ids else []
+            before = {
+                user_id: audit.project_role_names(connection, self.db, project_id, user_id)
+                for user_id in holders
+            }
+            # Holders lose the role by FK cascade
+            deleted = connection.execute(tbl.delete().where(*where)).rowcount
+            return deleted, [
+                _membership(connection, self.db, audit_ctx, project_id, user_id, before[user_id],
+                            details={"reason": "role_deleted"})
+                for user_id in holders
+            ]
+        #
+        return audit.transact(self.db, _change)
 
     @web.rpc("auth_get_project_role", "get_project_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
@@ -178,29 +199,37 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_add_project_user_role", "add_project_user_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def add_project_user_role(self, project_id, user_id, role_id):
+    def add_project_user_role(self, project_id, user_id, role_id, audit_ctx=None):
         values = {
             "project_id": project_id,
             "user_id": user_id,
             "role_id": role_id,
         }
+        state = {"epoch": None}
         #
-        with revocation.transaction(self.db) as connection:
+        def _change(connection):
+            before = audit.project_role_names(connection, self.db, project_id, user_id)
             result = connection.execute(
                 self.db.tbl.project_user_role.insert().values(**values)
             ).inserted_primary_key[0]
             # Project-role changes bump the user's epoch (see migration 202610151200)
-            epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+            state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id)
+            return result, [_membership(connection, self.db, audit_ctx, project_id, user_id, before)]
         #
-        if epoch is not None:
-            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        result = audit.transact(self.db, _change)
+        #
+        if state["epoch"] is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, state["epoch"])
         #
         return result
 
     @web.rpc("auth_delete_project_user_role", "delete_project_user_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def delete_project_user_role(self, project_id, user_id, role_id):
-        with revocation.transaction(self.db) as connection:
+    def delete_project_user_role(self, project_id, user_id, role_id, audit_ctx=None):
+        state = {"epoch": None}
+        #
+        def _change(connection):
+            before = audit.project_role_names(connection, self.db, project_id, user_id)
             deleted = connection.execute(
                 self.db.tbl.project_user_role.delete().where(
                     self.db.tbl.project_user_role.c.project_id == project_id,
@@ -208,19 +237,26 @@ class RPC:  # pylint: disable=R0903,E1101
                     self.db.tbl.project_user_role.c.role_id == role_id,
                 )
             ).rowcount
-            epoch = revocation.bump_epoch(connection, self.db, "user", user_id) \
-                if deleted else None
+            if not deleted:
+                return deleted, []
+            state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id)
+            return deleted, [_membership(connection, self.db, audit_ctx, project_id, user_id, before)]
         #
-        if epoch is not None:
-            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        deleted = audit.transact(self.db, _change)
+        #
+        if state["epoch"] is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, state["epoch"])
         #
         return deleted
 
     @web.rpc("auth_update_project_user_roles", "update_project_user_roles")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def update_project_user_roles(self, project_id, user_id, role_ids):
-        # Remove all roles and add new ones
-        with revocation.transaction(self.db) as connection:
+    def update_project_user_roles(self, project_id, user_id, role_ids, audit_ctx=None):
+        state = {"epoch": None}
+        #
+        def _change(connection):
+            before = audit.project_role_names(connection, self.db, project_id, user_id)
+            # Remove all roles and add new ones
             connection.execute(
                 self.db.tbl.project_user_role.delete().where(
                     self.db.tbl.project_user_role.c.project_id == project_id,
@@ -235,12 +271,15 @@ class RPC:  # pylint: disable=R0903,E1101
                         role_id=role_id
                     )
                 )
-            epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+            state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id)
+            return True, [_membership(connection, self.db, audit_ctx, project_id, user_id, before)]
         #
-        if epoch is not None:
-            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        result = audit.transact(self.db, _change)
         #
-        return True
+        if state["epoch"] is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, state["epoch"])
+        #
+        return result
 
     @web.rpc("auth_list_project_user_roles", "list_project_user_roles")
     @rpc_tools.wrap_exceptions(RuntimeError)
@@ -370,6 +409,30 @@ class RPC:  # pylint: disable=R0903,E1101
             results = connection.execute(query).all()
         #
         return [row[0] for row in results]
+
+    @web.rpc("auth_purge_project_memberships", "purge_project_memberships")
+    @rpc_tools.wrap_exceptions(RuntimeError)
+    def purge_project_memberships(self, project_id):
+        """ Drop the role assignments of a deleted project
+
+        No audit events: project deletion records member_removed for each member (#7504).
+        Without this, a later delete_user would record a second removal from the gone project.
+        """
+        pur = self.db.tbl.project_user_role
+        with revocation.transaction(self.db) as connection:
+            user_ids = sorted({row[0] for row in connection.execute(
+                pur.delete().where(pur.c.project_id == project_id).returning(pur.c.user_id)
+            ).all()})
+            epochs = {
+                user_id: revocation.bump_epoch(connection, self.db, "user", user_id)
+                for user_id in user_ids
+            }
+        #
+        for user_id, epoch in epochs.items():
+            if epoch is not None:
+                revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        #
+        return len(user_ids)
 
     @web.rpc("auth_apply_project_roles_snapshot", "apply_project_roles_snapshot")
     @rpc_tools.wrap_exceptions(RuntimeError)
@@ -507,9 +570,17 @@ class RPC:  # pylint: disable=R0903,E1101
 
             bumped = {}
             if assignments_to_insert:
+                touched = sorted({(a["project_id"], a["user_id"]) for a in assignments_to_insert})
+                before = {
+                    key: audit.project_role_names(connection, self.db, *key) for key in touched
+                }
                 connection.execute(
                     self.db.tbl.project_user_role.insert(), assignments_to_insert
                 )
+                audit.insert_best_effort(connection, self.db, [
+                    _membership(connection, self.db, audit.SYSTEM_CTX, p_id, u_id, before[(p_id, u_id)])
+                    for p_id, u_id in touched
+                ])
                 # Same connection, straight after the insert. Only additions are
                 # applied here, but a new assignment still changes what the
                 # user's cached permissions must say.

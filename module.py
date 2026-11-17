@@ -138,6 +138,10 @@ class Module(module.ModuleModel):
             f"{module_name}__project_user_role", self.db.metadata,
             autoload_with=self.db.engine,
         )
+        self.db.tbl.lifecycle_audit_inbox = sqlalchemy.Table(
+            f"{module_name}__lifecycle_audit_inbox", self.db.metadata,
+            autoload_with=self.db.engine,
+        )
         # Init
         self.descriptor.init_rpcs()
         self.descriptor.init_methods()
