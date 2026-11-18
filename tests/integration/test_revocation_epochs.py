@@ -342,6 +342,16 @@ def test_project_role_add_delete_and_replace_all_bump_the_user(access):
 
     assert [e[1]["epoch"] for e in access.events.fired] == [1, 2, 3]
 
+def test_project_role_removal_can_report_committed_membership_changes(access):
+    access.add_project_user_role(10, 1, 1)
+    access.events.fired.clear()
+
+    assert access.update_project_user_roles(10, 1, [], return_removed=True) is True
+    assert access.update_project_user_roles(10, 1, [], return_removed=True) is False
+    assert access.update_project_user_roles(10, 1, []) is True
+    assert epoch_of(access, "user", 1) == 2
+    assert access.events.fired == [("auth_invalidate", {"kind": "user", "id": 1, "epoch": 2})]
+
 
 def test_deleting_a_project_role_that_was_not_assigned_does_not_bump(access):
     assert access.delete_project_user_role(10, 1, 1) == 0
