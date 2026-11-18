@@ -251,18 +251,18 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_update_project_user_roles", "update_project_user_roles")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def update_project_user_roles(self, project_id, user_id, role_ids, audit_ctx=None):
+    def update_project_user_roles(self, project_id, user_id, role_ids, return_removed=False, audit_ctx=None):
         state = {"epoch": None}
         #
         def _change(connection):
             before = audit.project_role_names(connection, self.db, project_id, user_id)
             # Remove all roles and add new ones
-            connection.execute(
+            deleted_count = connection.execute(
                 self.db.tbl.project_user_role.delete().where(
                     self.db.tbl.project_user_role.c.project_id == project_id,
                     self.db.tbl.project_user_role.c.user_id == user_id,
                 )
-            )
+            ).rowcount
             for role_id in role_ids:
                 connection.execute(
                     self.db.tbl.project_user_role.insert().values(
@@ -271,15 +271,16 @@ class RPC:  # pylint: disable=R0903,E1101
                         role_id=role_id
                     )
                 )
-            state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id)
-            return True, [_membership(connection, self.db, audit_ctx, project_id, user_id, before)]
+            state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id) \
+                if deleted_count or role_ids else None
+            return bool(deleted_count), [_membership(connection, self.db, audit_ctx, project_id, user_id, before)]
         #
-        result = audit.transact(self.db, _change)
+        removed = audit.transact(self.db, _change)
         #
         if state["epoch"] is not None:
             revocation.fire_invalidate(self.context, "user", user_id, state["epoch"])
         #
-        return result
+        return removed if return_removed else True
 
     @web.rpc("auth_list_project_user_roles", "list_project_user_roles")
     @rpc_tools.wrap_exceptions(RuntimeError)
