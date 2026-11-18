@@ -26,7 +26,20 @@ from pylon.core.tools import web, log  # pylint: disable=E0401,E0611,W0611
 from sqlalchemy import select, bindparam, and_, func  # pylint: disable=E0401
 
 from ..tools import rpc_tools, revocation
+from ..tools import lifecycle_audit as audit
 from ..db import db_tools
+
+
+def _platform_role_event(connection, db, audit_ctx, user_id, mode, before, details=None):  # pylint: disable=R0913
+    """ user.platform_role_changed for one mode; None when the role set is unchanged """
+    after = audit.platform_role_names(connection, db, user_id, mode)
+    if after == before:
+        return None
+    user = audit.user_row(connection, db, user_id) or {"id": user_id}
+    return audit.build(
+        "user.platform_role_changed", audit_ctx, "platform", user=user,
+        roles_before=before, roles_after=after, details={"mode": mode, **(details or {})},
+    )
 
 
 class RPC:  # pylint: disable=R0903,E1101
@@ -86,14 +99,24 @@ class RPC:  # pylint: disable=R0903,E1101
 
     @web.rpc("auth_delete_role", "delete_role")
     @rpc_tools.wrap_exceptions(RuntimeError)
-    def delete_role(self, name: str, mode: str = "administration") -> None:
-        with self.db.engine.connect() as connection:
+    def delete_role(self, name: str, mode: str = "administration",
+                    audit_ctx: Optional[dict] = None) -> None:
+        def _change(connection):
             role_id = connection.execute(
                 self.db.tbl.role.select().where(
                     self.db.tbl.role.c.name == name,
                     self.db.tbl.role.c.mode == mode,
                 )
             ).mappings().first()["id"]
+            holders = sorted({row[0] for row in connection.execute(
+                self.db.tbl.user_role.select().with_only_columns(
+                    self.db.tbl.user_role.c.user_id,
+                ).where(self.db.tbl.user_role.c.role_id == role_id)
+            ).all()})
+            before = {
+                user_id: audit.platform_role_names(connection, self.db, user_id, mode)
+                for user_id in holders
+            }
             connection.execute(
                 self.db.tbl.user_role.delete().where(
                     self.db.tbl.user_role.c.role_id == role_id,
@@ -109,6 +132,13 @@ class RPC:  # pylint: disable=R0903,E1101
                     self.db.tbl.role.c.id == role_id,
                 )
             )
+            return None, [
+                _platform_role_event(connection, self.db, audit_ctx, user_id, mode,
+                                     before[user_id], details={"reason": "role_deleted"})
+                for user_id in holders
+            ]
+        #
+        audit.transact(self.db, _change)
 
     @web.rpc("auth_update_role_name", "update_role_name")
     @rpc_tools.wrap_exceptions(RuntimeError)
@@ -126,11 +156,12 @@ class RPC:  # pylint: disable=R0903,E1101
         return data
 
     @web.rpc("auth_assign_user_to_role", "assign_user_to_role")
-    def assign_user_to_role(self,
+    def assign_user_to_role(self,  # pylint: disable=R0913
                             user_id: int,
                             role_name: str,
                             mode: str = 'administration',
-                            project_id: Optional[int] = None) -> None:
+                            project_id: Optional[int] = None,
+                            audit_ctx: Optional[dict] = None) -> None:
         rpc_tools.validate_mode(mode)
         #
         rpc_timeout = self.descriptor.config.get("rpc_timeout", 120)
@@ -138,13 +169,18 @@ class RPC:  # pylint: disable=R0903,E1101
         match mode:
             case 'default':
                 assert project_id, 'projects_id is required for default mode assignment'
+                # Project membership: audited where auth_core commits it (project_roles)
                 self.context.rpc_manager.timeout(rpc_timeout).admin_add_user_to_project(
                     project_id=project_id,
                     user_id=user_id,
-                    role_names=[role_name]
+                    role_names=[role_name],
+                    audit_ctx=audit_ctx,
                 )
             case _:
-                with revocation.transaction(self.db) as connection:
+                state = {"epoch": None}
+                #
+                def _change(connection):
+                    before = audit.platform_role_names(connection, self.db, user_id, mode)
                     # Remove existing roles in this mode first (enforce single role)
                     existing_role_ids = [
                         row['id'] for row in connection.execute(
@@ -173,17 +209,25 @@ class RPC:  # pylint: disable=R0903,E1101
                             role_id=role_id,
                         )
                     )
-                    epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+                    state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id)
+                    return None, [_platform_role_event(
+                        connection, self.db, audit_ctx, user_id, mode, before,
+                    )]
                 #
-                if epoch is not None:
-                    revocation.fire_invalidate(self.context, "user", user_id, epoch)
+                audit.transact(self.db, _change)
+                #
+                if state["epoch"] is not None:
+                    revocation.fire_invalidate(self.context, "user", user_id, state["epoch"])
 
     @web.rpc("auth_remove_user_from_role", "remove_user_from_role")
     def remove_user_from_role(self,
                               user_id: int,
                               role_name: str,
-                              mode: str = 'administration') -> None:
-        with revocation.transaction(self.db) as connection:
+                              mode: str = 'administration',
+                              audit_ctx: Optional[dict] = None) -> None:
+        state = {"epoch": None}
+        #
+        def _change(connection):
             role = connection.execute(
                 self.db.tbl.role.select().where(
                     self.db.tbl.role.c.name == role_name,
@@ -192,18 +236,22 @@ class RPC:  # pylint: disable=R0903,E1101
             ).mappings().first()
             #
             if role is None:
-                return
+                return None, []
             #
+            before = audit.platform_role_names(connection, self.db, user_id, mode)
             connection.execute(
                 self.db.tbl.user_role.delete().where(
                     self.db.tbl.user_role.c.user_id == user_id,
                     self.db.tbl.user_role.c.role_id == role['id'],
                 )
             )
-            epoch = revocation.bump_epoch(connection, self.db, "user", user_id)
+            state["epoch"] = revocation.bump_epoch(connection, self.db, "user", user_id)
+            return None, [_platform_role_event(connection, self.db, audit_ctx, user_id, mode, before)]
         #
-        if epoch is not None:
-            revocation.fire_invalidate(self.context, "user", user_id, epoch)
+        audit.transact(self.db, _change)
+        #
+        if state["epoch"] is not None:
+            revocation.fire_invalidate(self.context, "user", user_id, state["epoch"])
 
     @web.rpc("auth_get_permissions", "get_permissions")
     def get_permissions(self, mode="administration"):
