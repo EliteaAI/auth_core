@@ -39,7 +39,6 @@ def _platform_role_event(connection, db, audit_ctx, user_id, mode, before, detai
     return audit.build(
         "user.platform_role_changed", audit_ctx, "platform", user=user,
         roles_before=before, roles_after=after, details={"mode": mode, **(details or {})},
-        admin_roles=audit.PLATFORM_ADMIN_ROLES,
     )
 
 

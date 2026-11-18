@@ -18,7 +18,9 @@
 """ Lifecycle audit (#7504): events written in the transaction that makes the change
 
 Rows land in the auth_core inbox; the admin plugin in pylon_main drains them into the
-partitioned audit table. Like revocation.py, shared logic lives here as plain functions.
+partitioned audit table. Payloads carry raw facts only: the admin drainer (``events.normalize``)
+is the one place that scrubs them and derives admin access and project type. Like revocation.py,
+shared logic lives here as plain functions.
 """
 
 import datetime
@@ -30,13 +32,8 @@ from . import revocation
 
 CTX_KEYS = ("actor_type", "actor_id", "actor_name", "actor_email", "source", "request_id")
 
-PLATFORM_ADMIN_ROLES = frozenset({"super_admin", "admin"})
-PROJECT_ADMIN_ROLES = frozenset({"admin"})
-
 SYSTEM_CTX = {"actor_type": "system", "actor_id": None, "actor_name": "System",
               "actor_email": None, "source": "system", "request_id": None}
-
-SECRET_MARKERS = ("password", "token", "secret", "credential", "key")
 
 
 class AuditWriteError(Exception):
@@ -54,30 +51,9 @@ def actor(audit_ctx):
     return result
 
 
-def scrub(value):
-    """ Drop secret-shaped keys at any depth """
-    if isinstance(value, dict):
-        return {
-            key: scrub(item) for key, item in value.items()
-            if not any(marker in str(key).lower() for marker in SECRET_MARKERS)
-        }
-    if isinstance(value, (list, tuple)):
-        return [scrub(item) for item in value]
-    return value
-
-
-def admin_access(before, after, admin_roles):
-    """ granted / revoked when an administrator role is gained / lost, else None """
-    had = bool(set(before or ()) & admin_roles)
-    has = bool(set(after or ()) & admin_roles)
-    if had == has:
-        return None
-    return "granted" if has else "revoked"
-
-
 def build(  # pylint: disable=R0913
         event_type, audit_ctx, scope, user=None, project_id=None,
-        roles_before=None, roles_after=None, changes=None, details=None, admin_roles=None,
+        roles_before=None, roles_after=None, changes=None, details=None,
 ):
     """ One inbox payload """
     user = user or {}
@@ -95,10 +71,9 @@ def build(  # pylint: disable=R0913
         "user_email": user.get("email"),
         "roles_before": roles_before,
         "roles_after": roles_after,
-        "admin_access": admin_access(roles_before, roles_after, admin_roles)
-        if admin_roles else None,
-        "changes": scrub(changes or {}),
-        "details": scrub(details or {}),
+        "admin_access": None,
+        "changes": changes or {},
+        "details": details or {},
     }
     event.update(actor(audit_ctx))
     return event
@@ -118,7 +93,6 @@ def membership_event(audit_ctx, project_id, user, before, after, details=None):
     return build(
         event_type, audit_ctx, "project", user=user, project_id=project_id,
         roles_before=before, roles_after=after, details=details,
-        admin_roles=PROJECT_ADMIN_ROLES,
     )
 
 
@@ -209,6 +183,8 @@ def transact(db, change):
 
     If only the event write fails, the change is applied again without events: an audit
     outage must never block a login or an admin operation (AC-23). It is logged loudly.
+    change may therefore run twice: it must not keep state across calls, except values it
+    overwrites on every run (the callers' epoch).
     """
     try:
         with revocation.transaction(db) as connection:

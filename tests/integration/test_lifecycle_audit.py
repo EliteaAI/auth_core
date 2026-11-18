@@ -305,7 +305,9 @@ def test_replace_all_with_same_roles_records_nothing(audit):
 
 # --- AC-5 / AC-6 platform roles and administrator access -------------------------
 
-def test_platform_admin_grant_and_revoke_flagged(audit):
+# admin_access is derived by the admin drainer (events.normalize); the inbox carries the role sets
+
+def test_platform_admin_grant_and_revoke_recorded(audit):
     user_id = make_user(audit)
     audit.assign_user_to_role(user_id=user_id, role_name="viewer", audit_ctx=ADMIN_CTX)
 
@@ -313,20 +315,24 @@ def test_platform_admin_grant_and_revoke_flagged(audit):
     audit.remove_user_from_role(user_id=user_id, role_name="super_admin", audit_ctx=ADMIN_CTX)
 
     changes = events(audit, "user.platform_role_changed")
-    assert [c["admin_access"] for c in changes] == [None, "granted", "revoked"]
+    assert [(c["roles_before"], c["roles_after"]) for c in changes] == [
+        ([], ["viewer"]), (["viewer"], ["super_admin"]), (["super_admin"], []),
+    ]
+    assert all(c["scope"] == "platform" for c in changes)
     assert changes[1]["roles_before"] == ["viewer"]
     assert changes[1]["roles_after"] == ["super_admin"]
     assert changes[1]["details"]["mode"] == "administration"
 
 
-def test_project_admin_role_flagged(audit):
+def test_project_admin_role_change_recorded(audit):
     user_id = make_user(audit)
     audit.update_project_user_roles(project_id=5, user_id=user_id, role_ids=[11])
 
     audit.update_project_user_roles(project_id=5, user_id=user_id, role_ids=[10], audit_ctx=ADMIN_CTX)
 
     [event] = events(audit, "project.member_role_changed")
-    assert event["admin_access"] == "granted"
+    assert (event["roles_before"], event["roles_after"]) == (["editor"], ["admin"])
+    assert event["scope"] == "project"
 
 
 # --- AC-9 / AC-10 same transaction -----------------------------------------------
@@ -389,7 +395,7 @@ def test_deleting_project_role_records_change_for_each_holder(audit):
     new = {e["user_id"]: e for e in events(audit)[already:]}
     assert new[ann]["event_type"] == "project.member_role_changed"
     assert new[ann]["roles_after"] == ["editor"]
-    assert new[ann]["admin_access"] == "revoked"
+    assert new[ann]["roles_before"] == ["admin", "editor"]
     assert new[bob]["event_type"] == "project.member_removed"
     assert new[bob]["details"]["reason"] == "role_deleted"
 
@@ -405,7 +411,6 @@ def test_deleting_platform_role_records_change_for_each_holder(audit):
     assert event["event_type"] == "user.platform_role_changed"
     assert event["roles_before"] == ["admin"]
     assert event["roles_after"] == []
-    assert event["admin_access"] == "revoked"
     assert event["details"]["reason"] == "role_deleted"
 
 

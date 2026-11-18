@@ -220,7 +220,6 @@ class RPC:  # pylint: disable=R0903,E1101
                 "user.deleted", audit_ctx, "platform", user=user,
                 roles_before=platform_roles, roles_after=[],
                 details={"projects": sorted(memberships)},
-                admin_roles=audit.PLATFORM_ADMIN_ROLES,
             )]
             for project_id, roles in memberships.items():
                 events.append(audit.membership_event(
